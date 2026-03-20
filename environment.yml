@@ -1,0 +1,41 @@
+name: gaio
+channels:
+  - conda-forge
+  - nvidia          # for cudatoolkit
+  - defaults
+
+dependencies:
+  # ── Python ────────────────────────────────────────────────────────────────
+  - python=3.11
+
+  # ── Core numerical stack (Phase 1 & 2) ───────────────────────────────────
+  - numpy>=1.26          # typed arrays, ravel_multi_index, set ops
+  - scipy>=1.12          # sparse CSR matrices for transfer operator (Phase 2)
+
+  # ── GPU acceleration (Phase 3) ────────────────────────────────────────────
+  # numba requires a compatible CUDA toolkit; pin to matching major versions.
+  # If running CPU-only, these can be omitted — Numba still works without CUDA.
+  - numba>=0.59          # @cuda.jit, @njit
+  - cudatoolkit=11.8     # CUDA 11.x runtime matched to numba 0.59
+
+  # ── Distributed computing (Phase 4) ──────────────────────────────────────
+  - mpi4py>=3.1          # MPI send/recv, Allreduce, Scatter/Gather
+
+  # ── Development & notebooks ──────────────────────────────────────────────
+  - jupyter
+  - ipykernel
+  - matplotlib>=3.8      # visualisation of box sets and invariant manifolds
+  - tqdm                 # progress bars in subdivision loops
+
+  # ── Profiling (Phase 4 bottleneck analysis) ───────────────────────────────
+  - line_profiler        # @profile decorator for per-line timing
+  - memory_profiler      # peak memory tracking
+
+  # ── Testing ───────────────────────────────────────────────────────────────
+  - pytest>=8
+  - pytest-cov
+
+  # ── pip-only packages ─────────────────────────────────────────────────────
+  - pip
+  - pip:
+    - cupy-cuda11x        # optional: CuPy arrays for CUDA host↔device transfers

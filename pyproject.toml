@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gaio"
+version = "0.1.0"
+description = "Global Analysis of Invariant Objects — Python port of GAIO.jl"
+readme = "ARCHITECTURE.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.12",
+]
+
+[project.optional-dependencies]
+gpu  = ["numba>=0.59", "cupy-cuda11x"]
+mpi  = ["mpi4py>=3.1"]
+dev  = [
+    "pytest>=8",
+    "pytest-cov",
+    "line_profiler",
+    "memory_profiler",
+    "jupyter",
+    "matplotlib>=3.8",
+    "tqdm",
+]
+
+[tool.setuptools.packages.find]
+# Discover gaio and all gaio.* subpackages automatically
+where   = ["."]
+include = ["gaio*"]
+
+[tool.pytest.ini_options]
+# Default test discovery root
+testpaths = ["tests"]
+# Show short tracebacks by default; use -v for verbose
+addopts   = "--tb=short"
+# Custom markers — use @pytest.mark.<name> on tests
+markers = [
+    "gaio_jl: direct port of a GAIO.jl test (exact same assertion)",
+    "slow: test that takes more than ~1 second (skipped by `make test-fast`)",
+    "gpu: requires a CUDA-capable GPU and numba",
+    "mpi: requires mpi4py and >= 2 MPI ranks",
+]

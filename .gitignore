@@ -1,0 +1,41 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ── Package build artefacts ───────────────────────────────────────────────────
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# ── pytest ────────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── Numba CUDA cache ──────────────────────────────────────────────────────────
+__pycache__/
+numba_cache/
+*.nbi
+*.nbc
+
+# ── IDE / OS ──────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ── Environment ───────────────────────────────────────────────────────────────
+.env
+.venv/
+
+# ── Reference sources (large external repo, not part of GAIO.py) ──────────────
+references/GAIO.jl-master/
