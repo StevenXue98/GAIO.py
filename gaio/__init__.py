@@ -29,6 +29,14 @@ from .algorithms import (
 )
 from .transfer import TransferOperator
 from .graph import BoxGraph
+from .cuda import (
+    AcceleratedBoxMap,
+    CUDADispatcher,
+    make_map_kernel,
+    map_parallel,
+    BACKEND_PYTHON, BACKEND_CPU, BACKEND_GPU,
+    cuda_available, numba_available,
+)
 
 __all__ = [
     # core
@@ -42,5 +50,10 @@ __all__ = [
     "relative_attractor", "unstable_set",
     "preimage", "alpha_limit_set", "maximal_invariant_set",
     "morse_sets", "morse_tiles", "recurrent_set",
+    # Phase 3 — heterogeneous acceleration
+    "AcceleratedBoxMap",
+    "CUDADispatcher", "make_map_kernel", "map_parallel",
+    "BACKEND_PYTHON", "BACKEND_CPU", "BACKEND_GPU",
+    "cuda_available", "numba_available",
 ]
-__version__ = "0.1.0-phase2"
+__version__ = "0.1.0-phase3"
