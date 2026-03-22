@@ -70,7 +70,6 @@ import math
 
 import numpy as np
 from numpy.typing import NDArray
-from numpy.typing import NDArray
 
 from gaio.core.box import F64
 from gaio.cuda.backends import (

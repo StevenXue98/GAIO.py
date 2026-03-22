@@ -58,4 +58,4 @@ __all__ = [
     "BACKEND_PYTHON", "BACKEND_CPU", "BACKEND_GPU",
     "cuda_available", "numba_available",
 ]
-__version__ = "0.1.0-phase3"
+__version__ = "0.1.0"

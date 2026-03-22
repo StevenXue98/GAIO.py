@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "gaio"
 version = "0.1.0"
 description = "Global Analysis of Invariant Objects — Python port of GAIO.jl"
-readme = "ARCHITECTURE.md"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
@@ -16,6 +16,15 @@ dependencies = [
 [project.optional-dependencies]
 gpu  = ["numba>=0.59", "cupy-cuda11x"]
 mpi  = ["mpi4py>=3.1"]
+# hpc: distributed eigensolve via SLEPc/PETSc (optional; Phase 4 falls back
+# to scipy ARPACK when not installed).  Install *after* building CUDA-aware
+# OpenMPI so that petsc4py links against the correct libmpi.so.
+# See docs/LAMBDA_CLOUD_SETUP.md for the correct install order.
+hpc  = [
+    "mpi4py>=3.1",   # must already link to CUDA-aware OpenMPI on HPC clusters
+    "petsc4py>=3.20",
+    "slepc4py>=3.20",
+]
 dev  = [
     "pytest>=8",
     "pytest-cov",

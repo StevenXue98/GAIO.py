@@ -30,12 +30,15 @@ For each cell ``j`` in ``domain``:
 3. Record how many hits land in each codomain cell ``i``.
 4. Normalise column ``j`` by the total number of hits (column-stochastic).
 
-Phase 3 MPI target
-------------------
-The inner loop over ``domain._keys`` in :func:`_build_transitions` is
-perfectly parallel — each source cell is independent.  For Phase 4,
-distribute ``domain._keys`` across MPI ranks, build local COO entries,
-then ``Allreduce`` and assemble the global sparse matrix.
+Phase 4 MPI
+-----------
+When running under ``mpirun`` (or when an explicit *comm* is passed),
+:func:`_build_transitions` distributes ``domain._keys`` across ranks via
+Morton-order decomposition (see :mod:`gaio.mpi.decompose`).  Each rank
+processes its local shard independently and contributes its COO entries to
+a global ``Allgatherv`` (see :mod:`gaio.mpi.gather`).  Every rank then
+assembles the same full sparse matrix, so all downstream spectral
+operations (``eigs``, ``svds``) work unchanged on every rank.
 """
 from __future__ import annotations
 
@@ -54,7 +57,9 @@ def _build_transitions(
     F: SampledBoxMap,
     domain: BoxSet,
     codomain: BoxSet,
-) -> tuple[NDArray, NDArray, NDArray]:
+    comm=None,
+    partition_weights=None,
+) -> tuple[NDArray, NDArray, NDArray, dict]:
     """
     Compute raw transition counts for building the transfer matrix.
 
@@ -72,73 +77,162 @@ def _build_transitions(
         Source cells (columns of the matrix).
     codomain : BoxSet
         Target cells (rows of the matrix).
+    comm : mpi4py communicator, _SerialComm, or None
+        MPI communicator to use.  ``None`` (default) auto-detects via
+        :func:`gaio.mpi.comm.get_comm`; pass ``False`` to force serial mode.
 
     Returns
     -------
     rows, cols, vals : ndarray
-        COO triplets (un-normalised; each val = 1.0).
+        COO triplets (un-normalised; each val = 1.0).  In MPI mode these
+        are the **global** triplets gathered from all ranks (identical on
+        every rank).
 
     Algorithm
     ---------
-    Mirrors the three-stage pipeline of :meth:`SampledBoxMap.map_boxes` but
-    tracks the source cell index for each test point so that COO column
-    indices can be reconstructed after the bulk map call:
+    Stage 1 — generate all (local_K × M) test points (vectorised NumPy).
+    Stage 2 — call ``F._apply_map(test_pts)`` — GPU kernel if available.
+    Stage 3 — vectorised key lookup + COO assembly.
+    Stage 4 — MPI ``Allgatherv`` to collect global COO (serial: no-op).
 
-    Stage 1 — generate ALL (K×M) test points at once (vectorised NumPy).
-    Stage 2 — call ``F._apply_map(test_pts)`` — GPU if available.
-    Stage 3 — vectorised key lookup + argsort-based COO assembly.
-
-    Notes
-    -----
-    Phase 4 MPI: split ``domain._keys`` across ranks (Stage 1), each rank
-    calls ``F._apply_map`` on its slice (Stage 2), then ``Allgatherv``
-    the COO triplets before assembling the global matrix.
+    MPI domain decomposition
+    ------------------------
+    ``domain._keys`` are Morton-sorted and split across ranks before
+    Stage 1.  Each rank processes its contiguous spatial shard; the column
+    indices in the COO output use **global** domain indices (position in
+    the full ``domain._keys`` array, not the local shard).  After
+    ``Allgatherv``, every rank holds the complete transition data and can
+    assemble the same global sparse matrix independently.
     """
-    K   = len(domain._keys)
-    M   = F.n_test_points
-    ndim = F.ndim
+    # ── Resolve communicator ─────────────────────────────────────────────────
+    if comm is False:
+        # Caller explicitly requested serial mode
+        from gaio.mpi.comm import _SerialComm
+        comm = _SerialComm()
+    elif comm is None:
+        from gaio.mpi.comm import get_comm
+        comm = get_comm()
+
+    mpi_size = comm.Get_size()
+    mpi_rank = comm.Get_rank()
+
+    # ── Global domain keys — needed for correct COO column indices ───────────
+    all_domain_keys = domain._keys          # shape (K,), int64, sorted
+
+    K     = len(all_domain_keys)
+    M     = F.n_test_points
+    ndim  = F.ndim
 
     if K == 0:
-        return np.empty(0, I64), np.empty(0, I64), np.empty(0, F64)
+        empty_stats = {
+            "n_ranks":           mpi_size,
+            "per_rank_nnz":      np.zeros(mpi_size, dtype=np.int64),
+            "total_nnz_raw":     0,
+            "partition_weights": np.empty(0, dtype=np.float32),
+        }
+        return np.empty(0, I64), np.empty(0, I64), np.empty(0, F64), empty_stats
 
-    unit_pts   = F._unit_points                      # (M, n)
-    cell_r_dom = domain.partition.cell_radius        # (n,)
+    unit_pts   = F._unit_points             # (M, ndim)
+    cell_r_dom = domain.partition.cell_radius  # (ndim,)
 
-    # ── Stage 1: generate all (K×M, ndim) test points at once ───────────────
-    # col_of[k*M + m] = k  (source cell index for COO column)
-    centers  = domain.centers()                      # (K, ndim)
-    test_pts = (
-        centers[:, np.newaxis, :]
-        + unit_pts[np.newaxis, :, :] * cell_r_dom[np.newaxis, np.newaxis, :]
-    ).reshape(K * M, ndim)                           # (K*M, ndim) C-contiguous
+    # ── MPI domain decomposition ─────────────────────────────────────────────
+    # Morton-sort all domain keys for spatial locality, then take local shard.
+    # Phase 5: when partition_weights is provided (and length matches K), use a
+    # weighted prefix-sum split so each rank gets ≈ equal total hit density.
+    # Phase 4 fallback (partition_weights=None): identical uniform K/P split.
+    if mpi_size > 1:
+        from gaio.mpi.decompose import morton_sort_keys, local_keys
+        morton_keys = morton_sort_keys(all_domain_keys, domain.partition)
+        if partition_weights is not None and len(partition_weights) == K:
+            from gaio.mpi.load_balance import weighted_local_keys
+            local_domain_keys = weighted_local_keys(
+                morton_keys, partition_weights, mpi_rank, mpi_size
+            )
+        else:
+            local_domain_keys = local_keys(morton_keys, mpi_rank, mpi_size)
+        # Global column index for each local key: position in all_domain_keys
+        local_col_offsets = np.searchsorted(all_domain_keys, local_domain_keys).astype(I64)
+    else:
+        local_domain_keys = all_domain_keys
+        local_col_offsets = np.arange(K, dtype=I64)
 
-    # ── Stage 2: apply map — GPU kernel if F is AcceleratedBoxMap ───────────
-    mapped = F._apply_map(test_pts)                  # (K*M, ndim)
+    local_K = len(local_domain_keys)
+    hits_per_cell = np.zeros(local_K, dtype=np.int32)   # Phase 5: per-cell hit count
+    if local_K == 0:
+        local_rows = np.empty(0, I64)
+        local_cols = np.empty(0, I64)
+        local_vals = np.empty(0, F64)
+    else:
+        # ── Stage 1: generate (local_K × M) test points ──────────────────────
+        # Build a temporary BoxSet view with only the local keys so we can
+        # call partition.centers() efficiently via the boxset helper.
+        from gaio.core.boxset import BoxSet as _BoxSet
+        local_bs  = _BoxSet(domain.partition, local_domain_keys)
+        centers   = local_bs.centers()          # (local_K, ndim)
 
-    # ── Stage 3: vectorised key lookup + COO assembly ────────────────────────
-    hit_keys   = codomain.partition.point_to_key_batch(mapped)   # (K*M,)
-    cod_keys   = codomain._keys                      # sorted int64, shape (m,)
-    m_cod      = len(cod_keys)
+        test_pts = (
+            centers[:, np.newaxis, :]
+            + unit_pts[np.newaxis, :, :] * cell_r_dom[np.newaxis, np.newaxis, :]
+        ).reshape(local_K * M, ndim)             # (local_K*M, ndim) C-contiguous
 
-    # Filter out misses (key == -1)
-    valid      = hit_keys >= 0
-    if not valid.any():
-        return np.empty(0, I64), np.empty(0, I64), np.empty(0, F64)
+        # ── Stage 2: apply map — GPU kernel if F is AcceleratedBoxMap ────────
+        mapped = F._apply_map(test_pts)          # (local_K*M, ndim)
 
-    hit_valid  = hit_keys[valid]                     # (n_hits,)
-    # Column index = source cell j = flat_index // M
-    flat_idx   = np.where(valid)[0]
-    col_valid  = (flat_idx // M).astype(I64)         # (n_hits,)
+        # ── Stage 3: vectorised key lookup + local COO assembly ──────────────
+        hit_keys = codomain.partition.point_to_key_batch(mapped)   # (local_K*M,)
+        cod_keys = codomain._keys                # sorted int64, shape (m,)
+        m_cod    = len(cod_keys)
 
-    # Binary-search hit keys into sorted codomain keys
-    row_cand   = np.searchsorted(cod_keys, hit_valid)
-    rc_clipped = np.minimum(row_cand, m_cod - 1)
-    matched    = (row_cand < m_cod) & (cod_keys[rc_clipped] == hit_valid)
+        valid = hit_keys >= 0
+        if not valid.any():
+            local_rows = np.empty(0, I64)
+            local_cols = np.empty(0, I64)
+            local_vals = np.empty(0, F64)
+        else:
+            hit_valid = hit_keys[valid]
+            flat_idx  = np.where(valid)[0]
+            # Local source-cell index within THIS rank's shard
+            local_src = (flat_idx // M).astype(I64)
+            # Map local index → global COO column
+            col_valid = local_col_offsets[local_src]
 
-    rows = row_cand[matched].astype(I64)
-    cols = col_valid[matched]
-    vals = np.ones(len(rows), dtype=F64)
-    return rows, cols, vals
+            row_cand   = np.searchsorted(cod_keys, hit_valid)
+            if m_cod == 0:
+                matched = np.zeros(len(row_cand), dtype=bool)
+            else:
+                rc_clipped = np.minimum(row_cand, m_cod - 1)
+                matched    = (row_cand < m_cod) & (cod_keys[rc_clipped] == hit_valid)
+
+            local_rows = row_cand[matched].astype(I64)
+            local_cols = col_valid[matched]
+            local_vals = np.ones(len(local_rows), dtype=F64)
+
+            # Phase 5: accumulate per-cell hit counts for next-frame weights.
+            # local_src[matched] maps each successful hit → local shard index.
+            # np.add.at is unbuffered: handles repeated indices correctly.
+            if matched.any():
+                np.add.at(hits_per_cell, local_src[matched], 1)
+
+    # ── Stage 4: Allgatherv — collect global COO from all ranks ─────────────
+    # allgather_coo returns a 4-tuple: (rows, cols, vals, per_rank_counts).
+    # per_rank_counts[r] = number of COO entries contributed by rank r.
+    # In serial mode (size==1) the fast-path returns inputs unchanged.
+    from gaio.mpi.gather import allgather_coo
+    rows, cols, vals, per_rank_counts = allgather_coo(
+        comm, local_rows, local_cols, local_vals
+    )
+
+    # Phase 5: gather per-cell hit counts into a global weight array.
+    from gaio.mpi.load_balance import compute_partition_weights
+    new_partition_weights = compute_partition_weights(hits_per_cell, comm)
+
+    mpi_stats = {
+        "n_ranks":           mpi_size,
+        "per_rank_nnz":      per_rank_counts,           # shape (n_ranks,)
+        "total_nnz_raw":     int(per_rank_counts.sum()), # before matrix dedup
+        "partition_weights": new_partition_weights,      # float32, shape (K,)
+    }
+    return rows, cols, vals, mpi_stats
 
 
 class TransferOperator:
@@ -154,6 +248,16 @@ class TransferOperator:
     codomain : BoxSet, optional
         Target cells.  If omitted, the codomain is set to the forward
         image of *domain* under *F* (same partition).
+    comm : mpi4py communicator, _SerialComm, or None
+        MPI communicator for distributed construction.  ``None`` (default)
+        auto-detects via :func:`gaio.mpi.comm.get_comm`; pass ``False`` to
+        force serial mode even when running under ``mpirun``.
+    partition_weights : ndarray, shape (K,), float32 or None
+        Phase 5 adaptive load balancing.  Pass ``T_prev.partition_weights``
+        from a previous frame to replace the uniform Morton split with a
+        weighted split that assigns keys proportionally to per-cell hit
+        density.  ``None`` (default) is identical to Phase 4.  If length
+        does not match ``len(domain)``, falls back silently to Phase 4.
 
     Attributes
     ----------
@@ -161,6 +265,17 @@ class TransferOperator:
     codomain : BoxSet
     mat : scipy.sparse.csc_matrix
         Column-stochastic sparse matrix of shape ``(|codomain|, |domain|)``.
+    mpi_stats : dict
+        Per-rank construction statistics.  Keys:
+
+        ``n_ranks``            — number of MPI ranks used (1 in serial mode).
+        ``per_rank_nnz``       — ndarray, shape (n_ranks,); COO entries from each rank
+                                 before sparse deduplication.
+        ``total_nnz_raw``      — sum of per_rank_nnz (≥ mat.nnz due to repeated (i,j)).
+        ``partition_weights``  — float32 ndarray, shape (K,); per-cell hit counts in
+                                 Morton order.  Pass as *partition_weights* to the
+                                 next frame's ``TransferOperator`` to activate Phase 5
+                                 weighted decomposition.
 
     Examples
     --------
@@ -181,22 +296,37 @@ class TransferOperator:
     (16, 16)
     """
 
-    __slots__ = ("boxmap", "domain", "codomain", "mat")
+    __slots__ = ("boxmap", "domain", "codomain", "mat", "mpi_stats", "_comm")
 
     def __init__(
         self,
         F: SampledBoxMap,
         domain: BoxSet,
         codomain: BoxSet | None = None,
+        comm=None,
+        partition_weights=None,
     ) -> None:
         self.boxmap = F
         self.domain = domain
+
+        # Resolve and store communicator for use in eigs() / svds()
+        if comm is False:
+            from gaio.mpi.comm import _SerialComm
+            self._comm = _SerialComm()
+        elif comm is None:
+            from gaio.mpi.comm import get_comm
+            self._comm = get_comm()
+        else:
+            self._comm = comm
 
         if codomain is None:
             codomain = F(domain)
         self.codomain = codomain
 
-        rows, cols, vals = _build_transitions(F, domain, codomain)
+        rows, cols, vals, self.mpi_stats = _build_transitions(
+            F, domain, codomain, comm=self._comm,
+            partition_weights=partition_weights,
+        )
         m = len(codomain)
         n = len(domain)
 
@@ -229,6 +359,33 @@ class TransferOperator:
             f"domain={len(self.domain)} cells, "
             f"codomain={len(self.codomain)} cells)"
         )
+
+    @property
+    def partition_weights(self):
+        """
+        Per-cell hit-density weights for Phase 5 adaptive partitioning.
+
+        A float32 array of shape ``(K,)`` (K = ``len(domain)``) in Morton
+        order.  Each element is the number of test points from that cell
+        that landed in the codomain during this construction pass.
+
+        Pass this to the next frame's ``TransferOperator`` (or
+        ``relative_attractor``) via the *partition_weights* argument to
+        activate Phase 5 weighted decomposition.  Use
+        :func:`gaio.mpi.load_balance.should_rebalance` to check whether
+        the imbalance is large enough to make rebalancing worthwhile.
+
+        Returns ``None`` when ``domain`` is empty (K=0).
+
+        See Also
+        --------
+        gaio.mpi.load_balance.compute_imbalance
+        gaio.mpi.load_balance.should_rebalance
+        """
+        weights = self.mpi_stats.get("partition_weights")
+        if weights is None or len(weights) == 0:
+            return None
+        return weights
 
     # ------------------------------------------------------------------
     # Measure push/pull
@@ -307,14 +464,18 @@ class TransferOperator:
         """
         Compute *k* eigenvalues and corresponding eigenmeasures.
 
+        Uses SLEPc (distributed Krylov–Schur) when running under MPI with
+        slepc4py installed; falls back to scipy ARPACK otherwise.
+
         Parameters
         ----------
         k : int
             Number of eigenvalues / eigenvectors.
         which : str
-            Which eigenvalues to find (``'LM'``, ``'SM'``, etc.).
+            Which eigenvalues to find (``'LM'``, ``'SM'``, ``'LR'``, ``'SR'``).
         v0 : ndarray, optional
-            Starting vector for the iterative solver.
+            Starting vector for ARPACK (scipy fallback only; SLEPc uses its
+            own initial vector strategy).
 
         Returns
         -------
@@ -324,20 +485,18 @@ class TransferOperator:
         Notes
         -----
         Matches Julia's ``Arpack.eigs(gstar, ...)``.
+        In MPI mode (comm.Get_size() > 1), uses
+        :func:`gaio.mpi.distributed_eigs.distributed_eigs`.
         """
-        n = len(self.domain)
-        if v0 is None:
-            v0 = np.ones(n, dtype=F64)
-        vals, vecs = spla.eigs(self.mat, k=k, which=which, v0=v0, **kwargs)
-        measures = [
-            BoxMeasure(
-                self.domain.partition,
-                self.domain._keys.copy(),
-                vecs[:, i].real.astype(F64),
-            )
-            for i in range(k)
-        ]
-        return vals, measures
+        from gaio.mpi.distributed_eigs import distributed_eigs
+        if v0 is not None:
+            kwargs.setdefault("v0", v0)
+        return distributed_eigs(
+            self.mat, k,
+            self.domain._keys, self.domain.partition,
+            comm=self._comm, which=which,
+            **kwargs,
+        )
 
     def svds(
         self, k: int = 3, **kwargs
@@ -345,27 +504,20 @@ class TransferOperator:
         """
         Compute *k* singular values and vectors.
 
+        Uses SLEPc Lanczos SVD when running under MPI with slepc4py;
+        falls back to scipy ARPACK otherwise.
+
         Returns
         -------
-        U : list of BoxMeasure  (left singular vectors, indexed by codomain)
+        U     : list of BoxMeasure  (left singular vectors, codomain-indexed)
         sigma : ndarray, shape (k,)
-        V : list of BoxMeasure  (right singular vectors, indexed by domain)
+        V     : list of BoxMeasure  (right singular vectors, domain-indexed)
         """
-        u, s, vt = spla.svds(self.mat, k=k, **kwargs)
-        U = [
-            BoxMeasure(
-                self.codomain.partition,
-                self.codomain._keys.copy(),
-                u[:, i].astype(F64),
-            )
-            for i in range(k)
-        ]
-        V = [
-            BoxMeasure(
-                self.domain.partition,
-                self.domain._keys.copy(),
-                vt[i, :].astype(F64),
-            )
-            for i in range(k)
-        ]
-        return U, s, V
+        from gaio.mpi.distributed_eigs import distributed_svds
+        return distributed_svds(
+            self.mat, k,
+            self.domain._keys,   self.domain.partition,
+            self.codomain._keys, self.codomain.partition,
+            comm=self._comm,
+            **kwargs,
+        )
