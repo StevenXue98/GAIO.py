@@ -39,3 +39,7 @@ Thumbs.db
 
 # ── Reference sources (large external repo, not part of GAIO.py) ──────────────
 references/GAIO.jl-master/
+
+# ── Golden master (local only — regenerate with: julia golden_master/generate.jl) ──
+golden_master/
+tests/test_golden_master.py

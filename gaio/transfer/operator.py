@@ -64,7 +64,10 @@ def _build_transitions(
 
     Parameters
     ----------
-    F : SampledBoxMap
+    F : SampledBoxMap (or AcceleratedBoxMap)
+        The box map.  If ``F`` is an :class:`~gaio.cuda.AcceleratedBoxMap`
+        with a GPU or CPU backend, Stage 2 (map application) runs on that
+        backend — exactly as in :meth:`~gaio.maps.base.SampledBoxMap.map_boxes`.
     domain : BoxSet
         Source cells (columns of the matrix).
     codomain : BoxSet
@@ -75,54 +78,65 @@ def _build_transitions(
     rows, cols, vals : ndarray
         COO triplets (un-normalised; each val = 1.0).
 
+    Algorithm
+    ---------
+    Mirrors the three-stage pipeline of :meth:`SampledBoxMap.map_boxes` but
+    tracks the source cell index for each test point so that COO column
+    indices can be reconstructed after the bulk map call:
+
+    Stage 1 — generate ALL (K×M) test points at once (vectorised NumPy).
+    Stage 2 — call ``F._apply_map(test_pts)`` — GPU if available.
+    Stage 3 — vectorised key lookup + argsort-based COO assembly.
+
     Notes
     -----
-    Phase 4 MPI: distribute ``domain._keys`` across ranks.  Each rank
-    computes its own ``(rows, cols, vals)`` and the root rank gathers
-    and assembles the global matrix.
+    Phase 4 MPI: split ``domain._keys`` across ranks (Stage 1), each rank
+    calls ``F._apply_map`` on its slice (Stage 2), then ``Allgatherv``
+    the COO triplets before assembling the global matrix.
     """
-    unit_pts = F._unit_points   # (M, n)
-    cell_r_dom = domain.partition.cell_radius   # (n,)
-    cell_r_cod = codomain.partition.cell_radius  # (n,)
-
-    # Pre-compute codomain partition info for vectorised lookup
-    cod_keys = codomain._keys    # sorted int64, shape (m,)
-    m = len(cod_keys)
-    n = len(domain._keys)
-    M = F.n_test_points
+    K   = len(domain._keys)
+    M   = F.n_test_points
     ndim = F.ndim
 
-    rows_list = []
-    cols_list = []
+    if K == 0:
+        return np.empty(0, I64), np.empty(0, I64), np.empty(0, F64)
 
-    # Phase 4: distribute this loop across MPI ranks
-    for j, src_key in enumerate(domain._keys):
-        box = domain.partition.key_to_box(int(src_key))
-        # Test points: center + unit_pts * cell_radius
-        test_pts = box.center + unit_pts * cell_r_dom   # (M, n)
+    unit_pts   = F._unit_points                      # (M, n)
+    cell_r_dom = domain.partition.cell_radius        # (n,)
 
-        # Apply map to all test points
-        mapped = np.empty((M, ndim), dtype=F64)
-        for i, p in enumerate(test_pts):
-            mapped[i] = np.asarray(F.map(p), dtype=F64)
+    # ── Stage 1: generate all (K×M, ndim) test points at once ───────────────
+    # col_of[k*M + m] = k  (source cell index for COO column)
+    centers  = domain.centers()                      # (K, ndim)
+    test_pts = (
+        centers[:, np.newaxis, :]
+        + unit_pts[np.newaxis, :, :] * cell_r_dom[np.newaxis, np.newaxis, :]
+    ).reshape(K * M, ndim)                           # (K*M, ndim) C-contiguous
 
-        # Find codomain keys hit
-        hit_keys = codomain.partition.point_to_key_batch(mapped)  # (M,), -1 for miss
+    # ── Stage 2: apply map — GPU kernel if F is AcceleratedBoxMap ───────────
+    mapped = F._apply_map(test_pts)                  # (K*M, ndim)
 
-        for hk in hit_keys:
-            if hk < 0:
-                continue
-            # Binary-search for hk in sorted codomain keys
-            i = int(np.searchsorted(cod_keys, hk))
-            if i < m and cod_keys[i] == hk:
-                rows_list.append(i)
-                cols_list.append(j)
+    # ── Stage 3: vectorised key lookup + COO assembly ────────────────────────
+    hit_keys   = codomain.partition.point_to_key_batch(mapped)   # (K*M,)
+    cod_keys   = codomain._keys                      # sorted int64, shape (m,)
+    m_cod      = len(cod_keys)
 
-    if not rows_list:
-        return np.empty(0, dtype=I64), np.empty(0, dtype=I64), np.empty(0, dtype=F64)
+    # Filter out misses (key == -1)
+    valid      = hit_keys >= 0
+    if not valid.any():
+        return np.empty(0, I64), np.empty(0, I64), np.empty(0, F64)
 
-    rows = np.array(rows_list, dtype=I64)
-    cols = np.array(cols_list, dtype=I64)
+    hit_valid  = hit_keys[valid]                     # (n_hits,)
+    # Column index = source cell j = flat_index // M
+    flat_idx   = np.where(valid)[0]
+    col_valid  = (flat_idx // M).astype(I64)         # (n_hits,)
+
+    # Binary-search hit keys into sorted codomain keys
+    row_cand   = np.searchsorted(cod_keys, hit_valid)
+    rc_clipped = np.minimum(row_cand, m_cod - 1)
+    matched    = (row_cand < m_cod) & (cod_keys[rc_clipped] == hit_valid)
+
+    rows = row_cand[matched].astype(I64)
+    cols = col_valid[matched]
     vals = np.ones(len(rows), dtype=F64)
     return rows, cols, vals
 

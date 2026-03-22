@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from gaio import Box, BoxPartition, BoxSet, GridMap, TransferOperator
+from gaio import Box, BoxPartition, BoxSet, SampledBoxMap, TransferOperator
 from gaio.core.boxmeasure import BoxMeasure
 
 
@@ -60,7 +60,7 @@ def run(n_cells: int = 256, n_test: int = 400, k_eigs: int = 3, show: bool = Tru
 
     # ── Box map with uniform 1-D test points ──────────────────────────────────
     unit_pts = np.linspace(-0.99, 0.99, n_test).reshape(-1, 1)  # (n_test, 1)
-    F = GridMap(f_logistic, domain, unit_pts)
+    F = SampledBoxMap(f_logistic, domain, unit_pts)
 
     # ── Transfer operator ─────────────────────────────────────────────────────
     S = BoxSet.full(P)
@@ -95,7 +95,7 @@ def run(n_cells: int = 256, n_test: int = 400, k_eigs: int = 3, show: bool = Tru
     # Exact invariant density for comparison
     x_exact = np.linspace(0.01, 0.99, 500)
     rho_exact = 1.0 / (np.pi * np.sqrt(x_exact * (1.0 - x_exact)))
-    rho_exact /= np.trapz(rho_exact, x_exact)   # normalise
+    rho_exact /= np.trapezoid(rho_exact, x_exact)   # normalise
 
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.bar(x_sorted, w_sorted * n_cells, width=1.0 / n_cells,

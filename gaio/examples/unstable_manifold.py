@@ -36,7 +36,7 @@ import argparse
 import math
 import numpy as np
 
-from gaio import Box, BoxPartition, BoxSet, GridMap, rk4_flow_map, unstable_set
+from gaio import Box, BoxPartition, BoxSet, SampledBoxMap, rk4_flow_map, unstable_set
 
 
 # ── Lorenz parameters ─────────────────────────────────────────────────────────
@@ -52,9 +52,7 @@ def lorenz_v(x: np.ndarray) -> np.ndarray:
     ])
 
 
-def f_lorenz(x: np.ndarray) -> np.ndarray:
-    """RK4 flow map: integrate Lorenz ODE for 20 steps of dt=0.01."""
-    return rk4_flow_map(lorenz_v, x, dt=0.05, n_steps=5)
+f_lorenz = rk4_flow_map(lorenz_v, step_size=0.05, steps=5)
 
 
 def run(
@@ -88,7 +86,7 @@ def run(
     t = np.array([-0.5, 0.0, 0.5])
     gx, gy, gz = np.meshgrid(t, t, t)
     unit_pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)  # (27, 3)
-    F = GridMap(f_lorenz, domain, unit_pts)
+    F = SampledBoxMap(f_lorenz, domain, unit_pts)
 
     # ── Seed: box covering the equilibrium  (√(β(ρ-1)), √(β(ρ-1)), ρ-1) ─────
     eq_x = math.sqrt(BETA * (RHO - 1.0))
@@ -99,7 +97,7 @@ def run(
 
     # ── Grow unstable set ─────────────────────────────────────────────────────
     print(f"[unstable_manifold] Growing unstable set ({steps} iterations) …")
-    W = unstable_set(F, S, max_steps=steps)
+    W = unstable_set(F, S)
     print(f"[unstable_manifold] Unstable manifold: {len(W)} cells")
 
     # ── 3-D plot with PyVista ─────────────────────────────────────────────────

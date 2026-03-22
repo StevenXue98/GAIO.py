@@ -34,7 +34,7 @@ import math
 import numpy as np
 
 from gaio import (
-    Box, BoxPartition, BoxSet, GridMap, rk4_flow_map,
+    Box, BoxPartition, BoxSet, SampledBoxMap, rk4_flow_map,
     unstable_set, TransferOperator,
 )
 from gaio.core.boxmeasure import BoxMeasure
@@ -54,9 +54,7 @@ def chua_v(x: np.ndarray) -> np.ndarray:
     ])
 
 
-def f_chua(x: np.ndarray) -> np.ndarray:
-    """RK4 flow map: 5 steps × dt=0.05."""
-    return rk4_flow_map(chua_v, x, dt=0.05, n_steps=5)
+f_chua = rk4_flow_map(chua_v, step_size=0.05, steps=5)
 
 
 def run(grid_res: int = 32, steps: int = 16, show: bool = True, off_screen: bool = False):
@@ -84,7 +82,7 @@ def run(grid_res: int = 32, steps: int = 16, show: bool = True, off_screen: bool
     t = np.array([-0.5, 0.0, 0.5])
     gx, gy, gz = np.meshgrid(t, t, t)
     unit_pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
-    F = GridMap(f_chua, domain, unit_pts)
+    F = SampledBoxMap(f_chua, domain, unit_pts)
 
     # ── Equilibria: x* = (±√(-3m₀/m₁), 0, ∓√(-3m₀/m₁)) ───────────────────
     eq_x = math.sqrt(-3.0 * M0 / M1)
@@ -101,7 +99,7 @@ def run(grid_res: int = 32, steps: int = 16, show: bool = True, off_screen: bool
 
     # ── Grow unstable manifold ────────────────────────────────────────────────
     print(f"[almost_invariant] Growing unstable set ({steps} iterations) …")
-    W = unstable_set(F, S, max_steps=steps)
+    W = unstable_set(F, S)
     print(f"[almost_invariant] Unstable manifold: {len(W)} cells")
 
     # ── Transfer operator ─────────────────────────────────────────────────────

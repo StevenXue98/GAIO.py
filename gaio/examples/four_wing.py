@@ -30,7 +30,7 @@ import argparse
 import numpy as np
 
 from gaio import (
-    Box, BoxPartition, BoxSet, GridMap, rk4_flow_map,
+    Box, BoxPartition, BoxSet, SampledBoxMap, rk4_flow_map,
     relative_attractor, TransferOperator, cuda_available, AcceleratedBoxMap,
 )
 from gaio.viz import plot_boxset_3d, plot_boxmeasure
@@ -49,32 +49,29 @@ def four_wing_v(x: np.ndarray) -> np.ndarray:
     ])
 
 
-def f_four_wing(x: np.ndarray) -> np.ndarray:
-    """RK4 flow map: 20 steps × dt=0.01."""
-    return rk4_flow_map(four_wing_v, x, dt=0.01, n_steps=20)
+f_four_wing = rk4_flow_map(four_wing_v, step_size=0.01, steps=20)
 
 
 def _make_gpu_map(domain, unit_pts):
     from numba import cuda
+    from gaio.cuda.rk4_cuda import make_cuda_rk4_flow_map
 
     @cuda.jit(device=True)
-    def f_device(x, out):
+    def four_wing_vfield(x, out):
+        """Four-wing vector field: writes f(x) into out."""
         out[0] = A_FW * x[0] + x[1] * x[2]
         out[1] = D_FW * x[1] + B_FW * x[0] - x[2] * x[1]
         out[2] = -x[2] - x[0] * x[1]
-        # Note: this is one RK4 step; for multi-step we fall back to Python
-        # because device functions cannot call host-side rk4_flow_map.
-        # For a fair GPU example, use n_steps=1 at a smaller dt.
 
-    # Use dt=0.01, n_steps=1 for GPU (single RK4 step per call)
-    # Compensate by running more subdivision steps
+    f_device = make_cuda_rk4_flow_map(four_wing_vfield, ndim=3,
+                                       step_size=0.01, steps=20)
     return AcceleratedBoxMap(f_four_wing, domain, unit_pts,
                               f_device=f_device, backend="gpu")
 
 
 def run(
-    grid_res: int = 16,
-    steps: int = 21,
+    grid_res: int = 4,
+    steps: int = 14,
     use_gpu: bool = True,
     show_3d: bool = True,
     show_2d: bool = True,
@@ -86,10 +83,12 @@ def run(
     Parameters
     ----------
     grid_res : int
-        Resolution per spatial dimension.  Default: 16
-        (Julia uses 2; we use 16 for a finer attractor image).
+        Resolution per spatial dimension.  Default: 4 (= 64 initial cells).
+        Julia uses 2; increase for a finer attractor at the cost of more RAM.
     steps : int
-        Subdivision steps.  Default: 21.
+        Subdivision steps.  Default: 14 (good quality in 3-D).
+        The Julia example uses 21 but starts from only 8 cells (grid_res=2);
+        use 21 here only with grid_res ≤ 2 to avoid OOM.
     use_gpu : bool
         Use GPU if available.  Default: True.
     show_3d : bool
@@ -113,8 +112,15 @@ def run(
     unit_pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
 
     gpu_used = False
-    F = GridMap(f_four_wing, domain, unit_pts)
-    print(f"[four_wing] Using Python backend  (GPU={gpu_used})")
+    if use_gpu and cuda_available():
+        try:
+            F = _make_gpu_map(domain, unit_pts)
+            gpu_used = True
+        except Exception as e:
+            print(f"[four_wing] GPU init failed ({e}), falling back to CPU")
+    if not gpu_used:
+        F = SampledBoxMap(f_four_wing, domain, unit_pts)
+    print(f"[four_wing] Using {'GPU' if gpu_used else 'Python'} backend  (GPU={gpu_used})")
 
     # ── Relative attractor ────────────────────────────────────────────────────
     S = BoxSet.full(P)
@@ -171,8 +177,8 @@ def run(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Four-wing attractor example")
-    parser.add_argument("--grid-res", type=int, default=16)
-    parser.add_argument("--steps", type=int, default=21)
+    parser.add_argument("--grid-res", type=int, default=4)
+    parser.add_argument("--steps", type=int, default=14)
     parser.add_argument("--no-gpu", dest="gpu", action="store_false")
     parser.add_argument("--no-show", dest="show", action="store_false")
     args = parser.parse_args()

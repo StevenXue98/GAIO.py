@@ -119,6 +119,29 @@ class SampledBoxMap:
         """Apply the BoxMap: return the outer-approximation image of *source*."""
         return self.map_boxes(source)
 
+    def _apply_map(self, test_pts: NDArray[F64]) -> NDArray[F64]:
+        """
+        Apply ``self.map`` to every row of *test_pts*.
+
+        This is Stage 2 of the three-stage pipeline shared by
+        :meth:`map_boxes` and :func:`~gaio.transfer.operator._build_transitions`.
+        Subclasses (:class:`~gaio.cuda.AcceleratedBoxMap`) override this
+        method to dispatch to GPU or CPU-parallel backends.
+
+        Parameters
+        ----------
+        test_pts : ndarray, shape (N, n), float64, C-contiguous
+
+        Returns
+        -------
+        ndarray, shape (N, n), float64
+        """
+        N, n = test_pts.shape
+        mapped = np.empty((N, n), dtype=F64)
+        for i, p in enumerate(test_pts):
+            mapped[i] = np.asarray(self.map(p), dtype=F64)
+        return mapped
+
     def map_boxes(self, source: BoxSet) -> BoxSet:
         """
         Compute the outer-approximation image of *source*.
@@ -126,8 +149,8 @@ class SampledBoxMap:
         Algorithm
         ---------
         1. **Vectorised** test-point generation: shape ``(K*M, n)``.
-        2. Apply ``self.map`` to each test point — **this loop is the
-           Phase 3 CUDA target**.
+        2. Apply ``self.map`` via :meth:`_apply_map` — overridden by
+           :class:`~gaio.cuda.AcceleratedBoxMap` to use GPU/CPU backends.
         3. **Vectorised** partition lookup via
            :meth:`BoxPartition.point_to_key_batch`.
 
@@ -152,21 +175,16 @@ class SampledBoxMap:
         M = self.n_test_points
         n = P.ndim
 
-        # ── Step 1: generate all test points in one vectorised step ──────────
-        # test_pts[k, m] = centers[k] + unit_pts[m] * cell_r
-        # Shape: (K, M, n) → reshape to (K*M, n)
+        # ── Stage 1: generate all test points in one vectorised step ─────────
         test_pts = (
             centers[:, np.newaxis, :]
             + unit_pts[np.newaxis, :, :] * cell_r[np.newaxis, np.newaxis, :]
         ).reshape(K * M, n)
 
-        # ── Step 2: apply map to every test point ───────────────────────────
-        # *** Phase 3: replace this Python loop with a @cuda.jit kernel ***
-        mapped = np.empty((K * M, n), dtype=F64)
-        for i, p in enumerate(test_pts):
-            mapped[i] = np.asarray(self.map(p), dtype=F64)
+        # ── Stage 2: apply map (CPU loop or GPU kernel via _apply_map) ───────
+        mapped = self._apply_map(test_pts)
 
-        # ── Step 3: find which cells were hit ───────────────────────────────
+        # ── Stage 3: find which cells were hit ───────────────────────────────
         hit_keys = P.point_to_key_batch(mapped)   # -1 for out-of-domain
         valid = hit_keys[hit_keys >= 0]
         return BoxSet(P, np.unique(valid).astype(I64))
