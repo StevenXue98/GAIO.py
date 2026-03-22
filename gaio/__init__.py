@@ -21,11 +21,12 @@ Phase 2 public API (BoxMap discretisation):
     MonteCarloMap — SampledBoxMap with random Monte-Carlo test points
 """
 from .core import Box, BoxPartition, BoxSet, BoxMeasure, F64, I64
-from .maps import SampledBoxMap, GridMap, MonteCarloMap, rk4_step, rk4_flow_map
+from .maps import SampledBoxMap, GridMap, MonteCarloMap, rk4_step, rk4_flow_map, rk4_flow_map_tspan, NonautonomousBoxMap
 from .algorithms import (
     relative_attractor, unstable_set,
     preimage, alpha_limit_set, maximal_invariant_set,
     morse_sets, morse_tiles, recurrent_set,
+    finite_time_lyapunov_exponents,
 )
 from .transfer import TransferOperator
 from .graph import BoxGraph
@@ -43,13 +44,14 @@ __all__ = [
     "Box", "BoxPartition", "BoxSet", "BoxMeasure", "F64", "I64",
     # maps
     "SampledBoxMap", "GridMap", "MonteCarloMap",
-    "rk4_step", "rk4_flow_map",
+    "rk4_step", "rk4_flow_map", "rk4_flow_map_tspan", "NonautonomousBoxMap",
     # transfer & graph
     "TransferOperator", "BoxGraph",
     # algorithms
     "relative_attractor", "unstable_set",
     "preimage", "alpha_limit_set", "maximal_invariant_set",
     "morse_sets", "morse_tiles", "recurrent_set",
+    "finite_time_lyapunov_exponents",
     # Phase 3 — heterogeneous acceleration
     "AcceleratedBoxMap",
     "CUDADispatcher", "make_map_kernel", "map_parallel",

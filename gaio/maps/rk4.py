@@ -124,3 +124,61 @@ def rk4_flow_map(f, step_size: float = 0.01, steps: int = 20):
         return state
 
     return g
+
+
+def rk4_flow_map_tspan(f, t0: float, t1: float, step_size: float = 0.01):
+    """
+    Build a flow map  Φ_{t0}^{t1}  for a **nonautonomous** ODE by composing
+    RK4 steps of size ``step_size`` from ``t0`` to ``t1``.
+
+    Parameters
+    ----------
+    f : callable
+        ODE right-hand side  f(x, t) → dx/dt.  Signature must accept a
+        1-D ``float64`` state array and a scalar time ``t``.
+    t0 : float
+        Integration start time.
+    t1 : float
+        Integration end time.  Must satisfy ``t1 > t0``.
+    step_size : float, optional
+        Nominal RK4 step size.  The actual step is adjusted so that an
+        integer number of steps exactly spans ``[t0, t1]``.  Default: 0.01.
+
+    Returns
+    -------
+    callable
+        A function  g(x) = Φ_{t0}^{t1}(x)  that maps an initial condition
+        ``x`` (shape (n,)) to its state at time ``t1``.  Pass this directly
+        as ``f`` to :class:`SampledBoxMap`.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from gaio.maps.rk4 import rk4_flow_map_tspan
+    >>> # Simple harmonic oscillator: x'' + x = 0  →  f(x,t) = [x1, -x0]
+    >>> def shm(x, t): return np.array([x[1], -x[0]])
+    >>> flow = rk4_flow_map_tspan(shm, t0=0.0, t1=np.pi)  # half period
+    >>> x0 = np.array([1.0, 0.0])
+    >>> x1 = flow(x0)
+    >>> round(float(x1[0]), 4)  # x(π) ≈ -1 for cos(t)
+    -1.0
+    """
+    T = t1 - t0
+    if T <= 0:
+        raise ValueError(f"t1 must be greater than t0, got t0={t0}, t1={t1}")
+    n_steps = max(1, int(round(T / step_size)))
+    h = T / n_steps
+
+    def g(x: NDArray[F64]) -> NDArray[F64]:
+        state = np.asarray(x, dtype=F64)
+        t = t0
+        for _ in range(n_steps):
+            k1 = np.asarray(f(state, t), dtype=F64)
+            k2 = np.asarray(f(state + 0.5 * h * k1, t + 0.5 * h), dtype=F64)
+            k3 = np.asarray(f(state + 0.5 * h * k2, t + 0.5 * h), dtype=F64)
+            k4 = np.asarray(f(state + h * k3, t + h), dtype=F64)
+            state = state + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+            t += h
+        return state
+
+    return g

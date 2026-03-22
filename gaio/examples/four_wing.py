@@ -140,7 +140,7 @@ def run(
     # Apply log|·| for visual contrast (matching Julia's  μ = log ∘ abs ∘ ev[1])
     from gaio.core.boxmeasure import BoxMeasure
     log_weights = np.log(np.abs(mu_inv._weights) + 1e-12)
-    mu_log = BoxMeasure(P, mu_inv._keys.copy(), log_weights)
+    mu_log = BoxMeasure(mu_inv.partition, mu_inv._keys.copy(), log_weights)
 
     # ── 3-D plot ──────────────────────────────────────────────────────────────
     pl = plot_boxset_3d(

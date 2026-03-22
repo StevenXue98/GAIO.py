@@ -8,11 +8,12 @@ compose plots by adding further artists (titles, colorbars, extra patches).
 
 Design
 ------
-* Uses ``matplotlib.collections.PatchCollection`` instead of adding one
-  ``Rectangle`` at a time — a single draw call for all N boxes.
-* The ``(N, 2)`` center array from ``BoxSet.centers()`` is used directly;
-  no Python-level loop over cells.
-* 3-D BoxSets are projected onto the first two components by default.
+* Uses ``matplotlib.collections.PolyCollection`` with a pre-built
+  ``(N, 4, 2)`` vertex array instead of constructing N ``Rectangle``
+  objects — a single vectorised pass for any N.
+* Centers are computed via the same ``np.unravel_index`` formula used by
+  ``BoxSet.centers()``, avoiding per-key Python calls to ``key_to_box``.
+* 3-D BoxSets are projected onto a chosen pair of dimensions (default: 0,1).
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from typing import Sequence
 
 import numpy as np
 
+from gaio.core.box import F64, I64
 from gaio.core.boxset import BoxSet
 from gaio.core.boxmeasure import BoxMeasure
 
@@ -33,6 +35,37 @@ def _require_matplotlib():
             "2-D plotting requires matplotlib.  Install with:\n"
             "    conda install matplotlib   or   pip install matplotlib"
         ) from exc
+
+
+def _centers_from_measure(measure: BoxMeasure) -> np.ndarray:
+    """Vectorised center lookup for a BoxMeasure — avoids per-key key_to_box calls."""
+    P = measure.partition
+    multi = np.stack(
+        np.unravel_index(measure._keys, P.dims), axis=1
+    ).astype(F64)  # (N, ndim)
+    return P.domain.lo + 2.0 * P.cell_radius * (multi + 0.5)  # (N, ndim)
+
+
+def _make_quad_verts(c0: np.ndarray, c1: np.ndarray,
+                     r0: float, r1: float) -> np.ndarray:
+    """
+    Build an (N, 4, 2) float64 array of axis-aligned quad vertices.
+
+    Each quad is the rectangle  [c0-r0, c0+r0] × [c1-r1, c1+r1].
+    Vertices are ordered counter-clockwise starting at the bottom-left.
+    No Python-level loop — fully vectorised NumPy.
+    """
+    N = len(c0)
+    verts = np.empty((N, 4, 2), dtype=np.float64)
+    verts[:, 0, 0] = c0 - r0   # BL x
+    verts[:, 0, 1] = c1 - r1   # BL y
+    verts[:, 1, 0] = c0 + r0   # BR x
+    verts[:, 1, 1] = c1 - r1   # BR y
+    verts[:, 2, 0] = c0 + r0   # TR x
+    verts[:, 2, 1] = c1 + r1   # TR y
+    verts[:, 3, 0] = c0 - r0   # TL x
+    verts[:, 3, 1] = c1 + r1   # TL y
+    return verts
 
 
 def plot_boxset(
@@ -76,8 +109,7 @@ def plot_boxset(
     """
     _require_matplotlib()
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
-    from matplotlib.collections import PatchCollection
+    from matplotlib.collections import PolyCollection
 
     dims = projection if projection is not None else [0, 1]
     d0, d1 = dims[0], dims[1]
@@ -91,17 +123,14 @@ def plot_boxset(
             ax.set_title(title)
         return ax
 
-    centers = boxset.centers()          # (N, n)
-    r       = boxset.cell_radius()      # (n,)
+    centers = boxset.centers()          # (N, ndim) — vectorised
+    r       = boxset.cell_radius()      # (ndim,)
     c0, c1  = centers[:, d0], centers[:, d1]
     r0, r1  = float(r[d0]),   float(r[d1])
 
-    patches = [
-        Rectangle((cx - r0, cy - r1), 2 * r0, 2 * r1)
-        for cx, cy in zip(c0, c1)
-    ]
-    pc = PatchCollection(
-        patches,
+    verts = _make_quad_verts(c0, c1, r0, r1)
+    pc = PolyCollection(
+        verts,
         facecolor=color,
         alpha=alpha,
         edgecolor=edge_color if edge_color else "none",
@@ -163,8 +192,7 @@ def plot_boxmeasure(
     import matplotlib.pyplot as plt
     import matplotlib.cm as cm
     import matplotlib.colors as mcolors
-    from matplotlib.patches import Rectangle
-    from matplotlib.collections import PatchCollection
+    from matplotlib.collections import PolyCollection
 
     dims = projection if projection is not None else [0, 1]
     d0, d1 = dims[0], dims[1]
@@ -179,11 +207,8 @@ def plot_boxmeasure(
             ax.set_title(title)
         return ax
 
-    centers = np.stack([
-        measure.partition.key_to_box(int(k)).center
-        for k in measure._keys
-    ])                                          # (N, n)
-    r   = measure.partition.cell_radius         # (n,)
+    centers = _centers_from_measure(measure)  # (N, ndim) — vectorised
+    r   = measure.partition.cell_radius       # (ndim,)
     c0  = centers[:, d0]
     c1  = centers[:, d1]
     r0, r1 = float(r[d0]), float(r[d1])
@@ -193,12 +218,9 @@ def plot_boxmeasure(
     cmap    = cm.get_cmap(colormap)
     colors  = cmap(norm(weights))              # (N, 4) RGBA
 
-    patches = [
-        Rectangle((cx - r0, cy - r1), 2 * r0, 2 * r1)
-        for cx, cy in zip(c0, c1)
-    ]
-    pc = PatchCollection(
-        patches,
+    verts = _make_quad_verts(c0, c1, r0, r1)
+    pc = PolyCollection(
+        verts,
         facecolor=colors,
         alpha=alpha,
         edgecolor=edge_color if edge_color else "none",
@@ -255,8 +277,7 @@ def plot_morse_tiles(
     _require_matplotlib()
     import matplotlib.pyplot as plt
     import matplotlib.cm as cm
-    from matplotlib.patches import Rectangle
-    from matplotlib.collections import PatchCollection
+    from matplotlib.collections import PolyCollection
 
     dims = projection if projection is not None else [0, 1]
     d0, d1 = dims[0], dims[1]
@@ -269,10 +290,7 @@ def plot_morse_tiles(
             ax.set_title(title)
         return ax
 
-    centers = np.stack([
-        tiles.partition.key_to_box(int(k)).center
-        for k in tiles._keys
-    ])
+    centers = _centers_from_measure(tiles)  # (N, ndim) — vectorised
     r   = tiles.partition.cell_radius
     c0, c1 = centers[:, d0], centers[:, d1]
     r0, r1 = float(r[d0]), float(r[d1])
@@ -282,12 +300,9 @@ def plot_morse_tiles(
     cmap    = cm.get_cmap(colormap, n_comp)
     colors  = cmap((labels - 1) % n_comp)          # 1-indexed → 0-indexed
 
-    patches = [
-        Rectangle((cx - r0, cy - r1), 2 * r0, 2 * r1)
-        for cx, cy in zip(c0, c1)
-    ]
-    pc = PatchCollection(
-        patches,
+    verts = _make_quad_verts(c0, c1, r0, r1)
+    pc = PolyCollection(
+        verts,
         facecolor=colors,
         alpha=alpha,
         edgecolor=edge_color if edge_color else "none",

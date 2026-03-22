@@ -286,3 +286,233 @@ self.kernel[bpg, tpb](d_test_pts, d_mapped, d_params)
 ```
 
 The `make_map_kernel` factory would produce a kernel that copies `d_params` into shared memory before the per-thread computation. No changes to `AcceleratedBoxMap.map_boxes` or the Phase 2 algorithm layer are required.
+
+---
+
+## 5. The `_apply_map` Protocol — Uniform Stage 2 Dispatch
+
+### 5.1 The Problem It Solves
+
+Prior to this fix, the `TransferOperator._build_transitions` function contained a Python double-loop:
+
+```python
+# OLD — bypassed GPU entirely
+for j, key in enumerate(domain._keys):        # K iterations
+    test_pts = generate_test_points(j)
+    for m, p in enumerate(test_pts):           # M iterations
+        mapped = F.map(p)                      # CPU Python call every time
+        ...
+```
+
+This meant that even when `F` was an `AcceleratedBoxMap` with a GPU backend, the `TransferOperator` build ran entirely on CPU at Python speed. The GPU path was only active for set-level operations (`relative_attractor`, `unstable_set`, etc.) — not for the final transfer matrix construction.
+
+### 5.2 The Fix: `_apply_map` as the Dispatch Hook
+
+`_apply_map(test_pts: NDArray[F64]) -> NDArray[F64]` is a new method on `SampledBoxMap` (the base class) that encapsulates exactly Stage 2:
+
+```python
+# gaio/maps/base.py — SampledBoxMap
+def _apply_map(self, test_pts: NDArray[F64]) -> NDArray[F64]:
+    N, n = test_pts.shape
+    mapped = np.empty((N, n), dtype=F64)
+    for i, p in enumerate(test_pts):
+        mapped[i] = np.asarray(self.map(p), dtype=F64)
+    return mapped
+```
+
+`AcceleratedBoxMap` overrides this to dispatch to GPU or CPU-parallel backends via `CUDADispatcher` or `map_parallel`. Both `map_boxes` and `_build_transitions` now call `F._apply_map(test_pts)` — one call with all K×M test points batched — rather than K×M individual `F.map(p)` calls.
+
+### 5.3 Architecture Before and After
+
+| Operation | Before fix | After fix |
+|-----------|-----------|-----------|
+| `relative_attractor`, `unstable_set`, etc. | ✓ GPU via `map_boxes → _apply_map` | ✓ unchanged |
+| `TransferOperator.__init__` | ✗ CPU Python loop (bypassed GPU) | ✓ GPU via `_build_transitions → _apply_map` |
+| `T.eigs`, `push_forward`, `pull_back` | CPU (scipy sparse) | CPU (scipy sparse — correct, fast) |
+| `morse_sets`, `recurrent_set` | ✗ partially (only set ops, not T construction) | ✓ fully GPU end-to-end |
+
+For a four-wing attractor computation (`grid_res=4, steps=14`) the `TransferOperator` build time dropped from minutes (Python loop) to seconds (single GPU kernel call over all K×M points).
+
+### 5.4 Phase 4 Implications
+
+The `_apply_map` hook is the natural MPI boundary for Phase 4. Rank `r` computes its local slice of `test_pts` (Stage 1) independently, calls `F._apply_map(test_pts_local)` (Stage 2 on local GPU), then contributes its COO entries to an MPI `Allgatherv` (inter-rank communication), then Stage 3 assembles the global sparse matrix. No changes to the kernel or GPU backend are required.
+
+---
+
+## 6. `make_cuda_rk4_flow_map` — CUDA ODE Flow Map Factory
+
+### 6.1 The Design Problem
+
+A CUDA device function for an ODE flow map must:
+1. Evaluate the vector field multiple times per point (once per RK4 stage, `steps` iterations)
+2. Allocate intermediate arrays (k1, k2, k3, k4, tmp) — but on the device these must be `cuda.local.array` (register/L1 scratchpad), **not** heap allocations
+3. Match the single-point signature `f_device(x: 1D array, out: 1D array) -> None`
+
+Without a factory, every user writing a new ODE had to manually inline the full RK4 loop in their device function — tedious, error-prone, and inconsistent with the CPU `rk4_flow_map` pattern.
+
+### 6.2 The Factory
+
+```python
+# gaio/cuda/rk4_cuda.py
+def make_cuda_rk4_flow_map(vfield_device, ndim: int, step_size: float, steps: int):
+    """
+    Create a CUDA device function that integrates vfield_device for `steps`
+    RK4 steps of size `step_size`.
+
+    Parameters
+    ----------
+    vfield_device : cuda.jit device function
+        Signature: vfield_device(x, out) -> None  (writes f(x) into out)
+    ndim : int
+        Spatial dimension (compile-time constant for local.array).
+    step_size : float
+        RK4 step size h.
+    steps : int
+        Number of RK4 steps to take.
+
+    Returns
+    -------
+    rk4_flow_device : cuda.jit device function
+        Signature: rk4_flow_device(x, out) -> None  (writes φ_T(x) into out)
+    """
+    @cuda.jit(device=True)
+    def rk4_flow_device(x, out):
+        k1  = cuda.local.array(ndim, numba.float64)
+        k2  = cuda.local.array(ndim, numba.float64)
+        k3  = cuda.local.array(ndim, numba.float64)
+        k4  = cuda.local.array(ndim, numba.float64)
+        tmp = cuda.local.array(ndim, numba.float64)
+        for i in range(ndim):
+            out[i] = x[i]
+        for _ in range(steps):
+            vfield_device(out, k1)
+            for i in range(ndim):
+                tmp[i] = out[i] + (step_size * 0.5) * k1[i]
+            vfield_device(tmp, k2)
+            for i in range(ndim):
+                tmp[i] = out[i] + (step_size * 0.5) * k2[i]
+            vfield_device(tmp, k3)
+            for i in range(ndim):
+                tmp[i] = out[i] + step_size * k3[i]
+            vfield_device(tmp, k4)
+            for i in range(ndim):
+                out[i] += (step_size / 6.0) * (
+                    k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]
+                )
+    return rk4_flow_device
+```
+
+### 6.3 Usage Pattern
+
+```python
+from numba import cuda
+from gaio.cuda.rk4_cuda import make_cuda_rk4_flow_map
+from gaio import AcceleratedBoxMap
+
+@cuda.jit(device=True)
+def my_vfield(x, out):
+    """User-defined vector field — writes f(x) into out."""
+    out[0] = ...
+    out[1] = ...
+
+# Create the flow map device function:
+f_device = make_cuda_rk4_flow_map(my_vfield, ndim=2, step_size=0.05, steps=10)
+
+# Plug into AcceleratedBoxMap:
+F = AcceleratedBoxMap(f_cpu, domain, unit_pts, f_device=f_device, backend="gpu")
+```
+
+### 6.4 CPU–GPU Parallelism of the Pattern
+
+The CPU `rk4_flow_map(vfield, step_size, steps)` → closure pattern and the GPU `make_cuda_rk4_flow_map(vfield_device, ndim, step_size, steps)` → device function pattern are intentionally symmetric:
+
+| Aspect | CPU (`rk4_flow_map`) | GPU (`make_cuda_rk4_flow_map`) |
+|--------|---------------------|-------------------------------|
+| Input | Python callable `vfield(x) -> ndarray` | CUDA device function `vfield_device(x, out) -> None` |
+| Output | Python closure `g(x) -> ndarray` | CUDA device function `rk4_flow_device(x, out) -> None` |
+| Intermediates | NumPy stack allocation inside closure | `cuda.local.array` (register-resident) |
+| `ndim` | Runtime (`len(x)`) | Compile-time constant (required by Numba) |
+| Integration | Identical Butcher tableau RK4 | Identical Butcher tableau RK4 |
+
+Because both use the **same Butcher tableau** and same floating-point order of operations, `rk4_flow_map` and `make_cuda_rk4_flow_map` produce bit-exact results for the same inputs — verified by the golden master test suite (Tests 8–9 for Lorenz 3D).
+
+---
+
+## 7. Complete GPU Pipeline Coverage
+
+### 7.1 End-to-End GPU Workflow
+
+The following table covers every user-facing function in GAIO.py and whether it dispatches to GPU when `F` is an `AcceleratedBoxMap(backend="gpu")`:
+
+| Function / Class | GPU-accelerated? | Where Stage 2 runs |
+|-----------------|-----------------|-------------------|
+| `SampledBoxMap.map_boxes` | No (Python loop) | CPU |
+| `AcceleratedBoxMap.map_boxes` | **Yes** | GPU via `CUDADispatcher` |
+| `AcceleratedBoxMap._apply_map` | **Yes** | GPU via `CUDADispatcher` |
+| `relative_attractor(F, B)` | **Yes** (calls `F(B)` → `map_boxes`) | GPU |
+| `unstable_set(F, B)` | **Yes** | GPU |
+| `maximal_invariant_set(F, B)` | **Yes** | GPU |
+| `preimage(F, B, C)` | **Yes** | GPU |
+| `alpha_limit_set(F, B)` | **Yes** | GPU |
+| `TransferOperator(F, D, C)` | **Yes** (post-fix) | GPU via `_build_transitions → _apply_map` |
+| `T.push_forward(μ)` | No | CPU sparse BLAS |
+| `T.pull_back(μ)` | No | CPU sparse BLAS |
+| `T.eigs(k)` | No | CPU (ARPACK via scipy) |
+| `T.svds(k)` | No | CPU (ARPACK via scipy) |
+| `morse_sets(T)` | No (graph ops) | CPU |
+| `recurrent_set(T)` | No (graph ops) | CPU |
+
+`T.eigs` and sparse matrix operations are not bottlenecks: scipy's ARPACK + MKL BLAS can handle sparse matrices of size ~10,000–100,000 in seconds. The bottleneck was always the construction of `T`, which is now GPU-accelerated.
+
+### 7.2 The Two Pipelines Side by Side
+
+**CPU pipeline** (laptop, no GPU):
+```
+BoxSet  →  SampledBoxMap.map_boxes  →  relative_attractor  →  BoxSet (attractor)
+                    ↓
+         TransferOperator (CPU _build_transitions, _apply_map)
+                    ↓
+         scipy.sparse.linalg.eigs  →  eigenmeasures
+```
+
+**GPU pipeline** (workstation or HPC node with NVIDIA GPU):
+```
+BoxSet  →  AcceleratedBoxMap.map_boxes  →  relative_attractor  →  BoxSet (attractor)
+  (GPU kernel: CUDA RK4 flow map)
+                    ↓
+         TransferOperator (GPU _build_transitions, _apply_map via CUDADispatcher)
+   (same CUDA kernel — all K×M test points in one launch)
+                    ↓
+         scipy.sparse.linalg.eigs  →  eigenmeasures (CPU — not the bottleneck)
+```
+
+The two pipelines are **identical at the algorithm level**. The only difference is the `F` object passed to each function. CPU → `SampledBoxMap`; GPU → `AcceleratedBoxMap(backend="gpu")`. No algorithm code changes.
+
+### 7.3 CLI and Runtime Backend Selection (four_wing example)
+
+```bash
+# CPU pipeline
+python -m gaio.examples.four_wing --no-gpu
+
+# GPU pipeline (default if CUDA available)
+python -m gaio.examples.four_wing
+
+# Finer resolution (more cells, more steps)
+python -m gaio.examples.four_wing --grid-res 6 --steps 18
+
+# Headless (no display, for cluster)
+python -m gaio.examples.four_wing --no-show
+```
+
+The `cuda_available()` check at runtime detects the GPU and falls back to CPU automatically — no user code change required.
+
+### 7.4 Memory Budget for GPU Pipeline
+
+For the four-wing attractor at `grid_res=4, steps=14`:
+- Initial cells: `4³ = 64`; after 14 subdivision steps: ~2,000–10,000 attractor cells
+- At 27 test points/cell (3×3×3 grid) and 3 dimensions: `10,000 × 27 × 3 × 8 bytes ≈ 6.5 MB` per `test_pts` array
+- GPU VRAM requirement: `2 × 6.5 MB` (input + output) ≈ **13 MB** — trivial for any modern GPU
+
+For `grid_res=6, steps=21` (Julia's reference resolution), attractor size grows to ~50,000+ cells:
+- `50,000 × 27 × 3 × 8 bytes ≈ 32 MB` per array → ~64 MB total — still well within GPU VRAM
+- CPU RAM for intermediate arrays in `relative_attractor`: O(total cells visited across all steps) — this is the binding constraint, not GPU VRAM. Use `grid_res ≤ 4` on machines with < 16 GB RAM.
