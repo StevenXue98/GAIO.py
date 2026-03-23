@@ -7,62 +7,49 @@ Architecture
 ------------
 Two-layer design, matching GAIO.jl's acceleration philosophy:
 
-1. ``make_map_kernel(f_device)``
+1. ``make_map_key_kernel(f_device, ndim)``
    A **kernel factory** that captures a user-supplied device function
-   ``f_device`` via closure and returns a compiled ``@cuda.jit`` kernel.
-   Numba compiles the kernel specialisation at first call — the closure
-   technique means the device function is a compile-time constant to
-   the PTX compiler, enabling full inlining and register allocation.
+   ``f_device`` and the spatial dimension ``ndim`` by closure, and returns
+   a compiled ``@cuda.jit`` kernel.  The kernel operates entirely in integer
+   key space on the input side and output side:
+
+     Input  : (K,)   int64 box keys  +  (M, n) unit test points (on device)
+     Output : (K*M,) int64 hit keys  (-1 for out-of-domain)
+
+   Each thread handles one (box, test-point) pair and performs three steps:
+     a. Decode the input key to a world-space test point (inline key → coords)
+     b. Apply ``f_device``
+     c. Encode the output coordinates back to a key (inline coords → key)
+
+   Compared to the previous coordinate-based kernel this eliminates:
+     - The (K*M, n) float64 test-point upload every subdivision step
+     - The (K*M, n) float64 mapped-coordinate download every step
+     - The CPU ``point_to_key_batch`` call (Stage 3)
+   The only transfers are (K,) int64 in and (K*M,) int64 out, matching
+   GAIO.jl's ``GPUSampledBoxMap`` transfer profile.
 
 2. ``CUDADispatcher``
-   Owns one compiled kernel, manages all host↔device memory transfers,
-   and performs grid/block arithmetic.  All ``cuda.to_device`` and
-   ``.copy_to_host`` calls are isolated here — the Phase 4 MPI path
-   will replace these two calls with GPUDirect RDMA transfers while
-   leaving the kernel call site unchanged.
+   Owns one compiled kernel and the on-device unit-point array.  The
+   unit-point array is uploaded once at construction and reused across all
+   subdivision steps.  Per-call cost: transfer ``(K,) int64`` in,
+   ``(K*M,) int64`` out, plus tiny partition-geometry arrays (~24 bytes each).
 
 Thread layout
 -------------
-We use a **1-D grid** of 1-D blocks.  Each thread handles exactly one
-test point (one row of the ``(N, n)`` ``test_pts`` array):
+1-D grid of 1-D blocks; each thread handles one (box key, test-point) pair:
 
-    Thread global index:  idx = blockIdx.x * blockDim.x + threadIdx.x
-                          (equivalently: cuda.grid(1))
-
-    Grid dimensions:
-        threads_per_block = 256          (multiple of warp size 32)
-        blocks_per_grid   = ⌈N / 256⌉   (covers all N points)
-
-    Guard:  ``if idx < N`` — handles the tail when N % 256 ≠ 0.
-
-The 1-D layout is optimal because:
-* Our work items (test points) are a 1-D list of length N = K × M.
-* All threads execute an identical instruction sequence (SIMT ideal).
-* The C-contiguous ``(N, n)`` layout means ``test_pts[idx]`` is a
-  contiguous n-element slice — coalesced global memory access when
-  threads in the same warp access consecutive rows AND n ≤ 32 bytes
-  (i.e., n ≤ 4 dimensions of float64).
+    total threads  N = K * M
+    thread index   idx = blockIdx.x * blockDim.x + threadIdx.x
+    box index      key_idx = idx // M
+    test-pt index  pt_idx  = idx  % M
 
 Requirements on ``f_device``
 -----------------------------
-* Must be decorated with ``@numba.cuda.jit(device=True)``.
-* Must accept **two** 1-D device-array views:
-    - ``x``   — input row, shape ``(n,)``  (read-only in practice)
-    - ``out`` — output row, shape ``(n,)`` (write-only; pre-allocated by kernel)
-* Must write the result into ``out`` in-place.  Do **not** return a value.
-
-This "output-parameter" pattern is required by Numba CUDA because device
-functions may not return heap-allocated arrays.  The kernel passes a direct
-view of one row of the ``mapped`` output buffer as ``out``, so no
-intermediate allocation occurs.
-
-Example user-defined device function (2-D harmonic oscillator)
---------------------------------------------------------------
->>> from numba import cuda
->>> @cuda.jit(device=True)
-... def f_device_harmonic(x, out):
-...     out[0] =  x[1]
-...     out[1] = -x[0]
+Unchanged from the previous design:
+* Must be ``@numba.cuda.jit(device=True)``.
+* Signature: ``f_device(x, out)`` — reads from ``x``, writes result into
+  ``out`` in-place (output-parameter pattern).
+* Both ``x`` and ``out`` are 1-D ``float64`` device-array views of length n.
 """
 from __future__ import annotations
 
@@ -71,7 +58,7 @@ import math
 import numpy as np
 from numpy.typing import NDArray
 
-from gaio.core.box import F64
+from gaio.core.box import F64, I64
 from gaio.cuda.backends import (
     THREADS_PER_BLOCK, MAX_THREADS_PER_BLOCK, detect_gpu_dtype,
 )
@@ -81,38 +68,31 @@ from gaio.cuda.backends import (
 # Kernel factory
 # ---------------------------------------------------------------------------
 
-def make_map_kernel(f_device):
+def make_map_key_kernel(f_device, ndim: int):
     """
-    Build a ``@cuda.jit`` kernel that applies *f_device* to every row of
-    ``test_pts``.
+    Build a ``@cuda.jit`` kernel that maps box keys to hit keys.
 
-    The kernel is compiled lazily on its first call and cached by Numba.
-    Subsequent calls with the same *f_device* reuse the compiled PTX.
+    Each thread decodes one input box key to a world-space test point,
+    applies ``f_device``, and encodes the output coordinates back to an
+    integer partition key.  Out-of-domain outputs are written as ``-1``.
 
     Parameters
     ----------
     f_device : ``@cuda.jit(device=True)`` callable
-        Device function with signature::
-
-            f_device(x: device_array[float64, 1D])
-                -> cuda.local.array[float64, 1D]
-
-        The output local array size must match ``test_pts.shape[1]``
-        at runtime (verified by the kernel via ``mapped.shape[1]``).
+        Device function: ``f_device(x, out) -> None``.
+        Reads from 1-D float64 view ``x``, writes result into ``out``.
+    ndim : int
+        Spatial dimension.  Captured as a compile-time constant so that
+        ``cuda.local.array(ndim, ...)`` inside the kernel is a static
+        allocation (registers / L1 scratchpad, not global memory).
 
     Returns
     -------
     kernel : Numba CUDA JIT function
-        Kernel callable as ``kernel[blocks, threads](test_pts, mapped)``.
-
-    Notes
-    -----
-    The closure captures ``f_device`` by reference.  Numba's CUDA JIT
-    compiler resolves ``f_device`` as a compile-time constant when it
-    lowers the kernel to PTX, enabling full inlining of the device
-    function body — no indirect function call overhead at runtime.
+        ``kernel[blocks, threads](in_keys, unit_pts, lo, cell_radius, dims, out_keys)``
     """
     try:
+        import numba
         from numba import cuda
     except ImportError as exc:
         raise ImportError(
@@ -120,116 +100,107 @@ def make_map_kernel(f_device):
         ) from exc
 
     @cuda.jit
-    def _map_kernel(test_pts, mapped):
+    def _map_key_kernel(in_keys, unit_pts, lo, cell_radius, dims, out_keys):
         """
-        CUDA kernel: apply f_device to one row of test_pts per thread.
+        CUDA kernel: decode key → test point → apply f_device → encode key.
 
-        Grid / block layout
-        -------------------
-        Dimension: 1-D grid of 1-D blocks.
-
-        ``cuda.grid(1)`` computes the absolute thread index:
-            idx = blockIdx.x * blockDim.x + threadIdx.x
-
-        Each thread with ``idx < N`` processes exactly one test point:
-            input  : test_pts[idx]   — row view, shape (n,)
-            output : mapped[idx]     — row view, shape (n,)
-
-        The guard ``if idx < test_pts.shape[0]`` handles the tail block
-        when N is not a multiple of ``threads_per_block``.
-
-        Memory access pattern
-        ---------------------
-        Threads in a warp have consecutive ``idx`` values, so they
-        access consecutive rows of ``test_pts``.  For C-contiguous
-        row-major storage this gives coalesced reads when the row
-        stride (n * 8 bytes) aligns to 128-byte cache lines — true
-        for n ≥ 2 (≥ 16 bytes per row).  Writing to ``mapped[idx]``
-        (the output row view) is likewise coalesced across the warp.
-
-        Output-parameter pattern
-        ------------------------
-        ``out = mapped[idx]`` is a **direct view** into one row of the
-        output buffer in global memory.  Passing it to ``f_device(x, out)``
-        lets the device function write its result directly — zero
-        intermediate allocation, zero extra copies.  Numba CUDA requires
-        this pattern because device functions cannot return heap arrays.
+        Parameters (device arrays)
+        --------------------------
+        in_keys     : (K,)     int64   — input box keys
+        unit_pts    : (M, n)   float64 — unit test points in [-1, 1]^n
+        lo          : (n,)     float64 — partition domain lower bound
+        cell_radius : (n,)     float64 — half-width of each grid cell
+        dims        : (n,)     int64   — grid resolution per dimension
+        out_keys    : (K*M,)   int64   — output hit keys (-1 = miss)
         """
-        # ── One thread per test point ────────────────────────────────────
-        idx = cuda.grid(1)                        # absolute thread index
-        if idx < test_pts.shape[0]:
-            # Slice: 1-D view of the idx-th row in global memory
-            x   = test_pts[idx]
-            out = mapped[idx]          # direct output row view — no alloc
+        idx = cuda.grid(1)
+        M = unit_pts.shape[0]
+        if idx >= in_keys.shape[0] * M:
+            return
 
-            # Device function writes result into out in-place.
-            # PTX compiler inlines f_device here (no indirect call).
-            f_device(x, out)
+        key_idx = idx // M
+        pt_idx  = idx % M
 
-    return _map_kernel
+        in_key = in_keys[key_idx]
+
+        # ── Allocate local scratch arrays (registers / L1) ───────────────
+        # ndim is a Python int captured from closure → compile-time constant
+        x   = cuda.local.array(ndim, numba.float64)
+        out = cuda.local.array(ndim, numba.float64)
+
+        # ── Step 1: decode in_key to world-space test point ──────────────
+        # Row-major unravel: for dims = (d0, d1, ..., d_{n-1}),
+        #   key = i0*d1*...*d_{n-1} + i1*d2*...*d_{n-1} + ... + i_{n-1}
+        # Recover from least-significant dimension first:
+        #   i_{n-1} = key % d_{n-1};  remainder = key // d_{n-1}  ; ...
+        # Cell center and test point for dimension i:
+        #   center[i]  = lo[i] + cell_radius[i] * (2 * mi + 1)
+        #   x[i]       = center[i] + cell_radius[i] * unit_pts[pt_idx, i]
+        #              = lo[i] + cell_radius[i] * (2*mi + 1 + unit_pts[pt_idx, i])
+        rem = in_key
+        for i in range(ndim - 1, -1, -1):
+            mi  = rem % dims[i]
+            rem = rem // dims[i]
+            x[i] = lo[i] + cell_radius[i] * (2.0 * mi + 1.0 + unit_pts[pt_idx, i])
+
+        # ── Step 2: apply map ────────────────────────────────────────────
+        f_device(x, out)
+
+        # ── Step 3: encode output point to partition key ─────────────────
+        # Compute   fi = (out[i] - lo[i]) / (2 * cell_radius[i])
+        # If fi < 0 or fi >= dims[i]: out of domain → write -1.
+        # Otherwise: mi_out = floor(fi); accumulate row-major key.
+        out_key   = numba.int64(0)
+        in_domain = True
+        for i in range(ndim):
+            fi = (out[i] - lo[i]) / (2.0 * cell_radius[i])
+            if fi < 0.0 or fi >= numba.float64(dims[i]):
+                in_domain = False
+                break
+            mi_out = numba.int64(fi)
+            # Safety clamp for floating-point boundary edge cases
+            if mi_out >= dims[i]:
+                mi_out = dims[i] - numba.int64(1)
+            out_key = out_key * dims[i] + mi_out
+
+        out_keys[idx] = out_key if in_domain else numba.int64(-1)
+
+    return _map_key_kernel
 
 
 # ---------------------------------------------------------------------------
-# CUDADispatcher — memory management + kernel launch
+# CUDADispatcher — unit-point cache + kernel launch
 # ---------------------------------------------------------------------------
 
 class CUDADispatcher:
     """
-    Manages host↔device memory transfers and launches the compiled CUDA
-    kernel for the map-boxes inner loop.
+    Manages the on-device unit-point array and launches the compiled kernel.
+
+    The unit-point array ``(M, n) float64`` is uploaded to VRAM once at
+    construction and reused across all subdivision steps — eliminating the
+    per-step test-point upload of the previous coordinate-based design.
+
+    Per-call transfers (negligible):
+        In  : ``(K,) int64``    — input box keys for this rank's shard
+        Out : ``(K*M,) int64``  — hit keys (-1 for out-of-domain)
+        Partition geometry (lo, cell_radius, dims): 3 × (n,) arrays, ~72 bytes
 
     Parameters
     ----------
     f_device : ``@cuda.jit(device=True)`` callable
-        Device function (see :func:`make_map_kernel`).
+    unit_points : ndarray, shape (M, n), float64
+        Test points in the unit cube ``[-1, 1]^n``.  Uploaded to VRAM here.
     threads_per_block : int, optional
-        Number of CUDA threads per block.  Must be a multiple of 32
-        (warp size).  Default: 256.
-    dtype : np.float32 or np.float64 or None, optional
-        Compute dtype for GPU arrays.  If ``None`` (default), calls
-        :func:`~gaio.cuda.backends.detect_gpu_dtype` to choose
-        automatically based on the device's FP64 throttle ratio:
-
-        * Consumer GPU (ratio ≥ 32, e.g. RTX 4080 ratio=64) → ``np.float32``
-        * Datacenter GPU (ratio < 32, e.g. A100 ratio=2)    → ``np.float64``
-
-        Set explicitly to ``np.float64`` to force double precision on any GPU.
-
-    Attributes
-    ----------
-    kernel : Numba CUDA JIT function
-    threads_per_block : int
-    dtype : numpy dtype
-        Effective compute dtype used inside the GPU kernel.
-
-    Precision note
-    --------------
-    ``test_pts`` (generated in float64 by the partition arithmetic) is cast
-    to ``self.dtype`` before ``cuda.to_device``.  The kernel runs entirely
-    in ``self.dtype``.  The result is cast back to ``float64`` on the host
-    after ``copy_to_host`` so that downstream code (``point_to_key_batch``)
-    always receives ``float64``.  The host-side cast is a vectorised NumPy
-    operation — negligible cost compared to the GPU kernel.
-
-    Phase 4 note
-    ------------
-    The two lines::
-
-        d_test_pts = cuda.to_device(test_pts)      # host → device
-        result = d_mapped.copy_to_host()           # device → host
-
-    are the **only** host↔device transfer points in the entire library.
-    In Phase 4, these will be replaced with::
-
-        d_test_pts = cuda.to_device(local_slice)   # MPI rank's slice
-        comm.Send(d_mapped, dest=root, ...)        # GPUDirect RDMA
-
-    The kernel call site (``self.kernel[...](...)``) is unchanged.
+        Default: 256.  Must be a multiple of 32.
+    dtype : np.float32, np.float64, or None
+        Retained for API compatibility; the key-based kernel always runs in
+        float64 (correct on datacenter GPUs with full FP64 throughput).
     """
 
     def __init__(
         self,
         f_device,
+        unit_points: NDArray[F64],
         threads_per_block: int = THREADS_PER_BLOCK,
         dtype=None,
     ) -> None:
@@ -243,92 +214,78 @@ class CUDADispatcher:
                 f"threads_per_block ({threads_per_block}) exceeds hardware "
                 f"maximum ({MAX_THREADS_PER_BLOCK})."
             )
-        self.threads_per_block = threads_per_block
-        # Resolve dtype: auto-detect if not specified
-        self.dtype = detect_gpu_dtype() if dtype is None else np.dtype(dtype)
-        # Compile kernel once at construction — amortises PTX compilation cost
-        self.kernel = make_map_kernel(f_device)
-
-    # ------------------------------------------------------------------
-    # Grid geometry
-    # ------------------------------------------------------------------
-
-    def _grid_dims(self, N: int) -> tuple[int, int]:
-        """
-        Compute (blocks_per_grid, threads_per_block) for N work items.
-
-        The formula  blocks = ⌈N / TPB⌉  ensures every work item gets
-        a thread.  The guard in the kernel discards the surplus threads
-        in the last block when N % threads_per_block ≠ 0.
-
-        Parameters
-        ----------
-        N : int
-            Total number of work items (= K * M, test points).
-
-        Returns
-        -------
-        (blocks_per_grid, threads_per_block) : tuple[int, int]
-        """
-        tpb = self.threads_per_block
-        bpg = math.ceil(N / tpb)         # ⌈N / TPB⌉ — covers all N threads
-        return bpg, tpb
-
-    # ------------------------------------------------------------------
-    # Main dispatch — the only host↔device transfer site
-    # ------------------------------------------------------------------
-
-    def __call__(self, test_pts: NDArray[F64]) -> NDArray[F64]:
-        """
-        Apply the CUDA kernel to *test_pts* and return the mapped array.
-
-        Steps
-        -----
-        1. ``cuda.to_device``        — transfer input to VRAM
-        2. ``cuda.device_array``     — allocate output in VRAM
-        3. ``kernel[bpg, tpb]``      — launch GPU kernel
-        4. ``copy_to_host``          — retrieve result into pinned host RAM
-        5. Return the host array
-
-        Parameters
-        ----------
-        test_pts : ndarray, shape (N, n), float64, C-contiguous
-            Test points generated by the calling BoxMap.
-
-        Returns
-        -------
-        ndarray, shape (N, n), float64, C-contiguous
-            Mapped points.
-        """
         try:
             from numba import cuda
         except ImportError as exc:
             raise ImportError("GPU backend requires numba.") from exc
 
-        # Cast to compute dtype (float32 on consumer GPU, float64 on datacenter).
-        # Halves PCIe transfer size when dtype=float32; kernel arithmetic runs
-        # at full TFLOPS instead of 1/64 speed on consumer cards.
-        pts = np.ascontiguousarray(test_pts, dtype=self.dtype)
-        N, n = pts.shape
+        self.threads_per_block = threads_per_block
+        self.dtype = detect_gpu_dtype() if dtype is None else np.dtype(dtype)
+
+        unit_pts = np.ascontiguousarray(unit_points, dtype=np.float64)
+        ndim = unit_pts.shape[1]
+
+        # Compile kernel once — amortises PTX compilation across all steps
+        self.kernel = make_map_key_kernel(f_device, ndim)
+
+        # Upload unit points once — reused every subdivision step
+        self.d_unit_pts = cuda.to_device(unit_pts)
+
+    # ------------------------------------------------------------------
+    # Grid geometry (unchanged)
+    # ------------------------------------------------------------------
+
+    def _grid_dims(self, N: int) -> tuple[int, int]:
+        """Return (blocks_per_grid, threads_per_block) covering N work items."""
+        tpb = self.threads_per_block
+        bpg = math.ceil(N / tpb)
+        return bpg, tpb
+
+    # ------------------------------------------------------------------
+    # Main dispatch
+    # ------------------------------------------------------------------
+
+    def __call__(
+        self,
+        in_keys: NDArray[I64],
+        partition,
+    ) -> NDArray[I64]:
+        """
+        Map box keys to hit keys via the CUDA kernel.
+
+        Parameters
+        ----------
+        in_keys : ndarray, shape (K,), int64
+            Flat partition keys of the boxes to map (this rank's shard).
+        partition : BoxPartition
+            Current partition (geometry changes each subdivision step).
+
+        Returns
+        -------
+        out_keys : ndarray, shape (K*M,), int64
+            Hit keys; -1 for out-of-domain outputs.
+            Pass through ``out_keys[out_keys >= 0]`` then ``np.unique``
+            to obtain the image BoxSet keys.
+        """
+        from numba import cuda
+
+        keys = np.ascontiguousarray(in_keys, dtype=I64)
+        K    = len(keys)
+        M    = self.d_unit_pts.shape[0]
+        N    = K * M
         bpg, tpb = self._grid_dims(N)
 
-        # ── Step 1: host → device ────────────────────────────────────────
-        # Phase 4 replacement: cuda.to_device(mpi_local_slice)
-        d_test_pts = cuda.to_device(pts)
+        # Transfer input keys to device (K × 8 bytes — small)
+        d_in_keys  = cuda.to_device(keys)
+        d_out_keys = cuda.device_array(N, dtype=I64)
 
-        # ── Step 2: allocate output buffer in VRAM ───────────────────────
-        d_mapped = cuda.device_array((N, n), dtype=self.dtype)
+        # Partition geometry — tiny arrays; Numba auto-transfers numpy arrays
+        lo          = np.ascontiguousarray(partition.domain.lo,   dtype=np.float64)
+        cell_radius = np.ascontiguousarray(partition.cell_radius, dtype=np.float64)
+        dims        = np.ascontiguousarray(partition.dims,        dtype=I64)
 
-        # ── Step 3: kernel launch ────────────────────────────────────────
-        # Grid: [bpg blocks] × [tpb threads/block]
-        # Total threads launched: bpg * tpb ≥ N  (surplus guarded in kernel)
-        self.kernel[bpg, tpb](d_test_pts, d_mapped)
+        self.kernel[bpg, tpb](
+            d_in_keys, self.d_unit_pts, lo, cell_radius, dims, d_out_keys
+        )
 
-        # ── Step 4: device → host, then upcast to float64 ────────────────
-        # Phase 4 replacement: GPUDirect RDMA send to MPI root rank.
-        # The upcast to float64 is a vectorised NumPy op on CPU — negligible
-        # cost.  Downstream code (point_to_key_batch) always sees float64.
-        result = d_mapped.copy_to_host()
-        if result.dtype != np.float64:
-            result = result.astype(np.float64)
-        return result
+        return d_out_keys.copy_to_host()   # (K*M,) int64

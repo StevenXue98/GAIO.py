@@ -6,7 +6,7 @@ Public API
 AcceleratedBoxMap        — drop-in SampledBoxMap replacement with Numba backends
 make_cuda_rk4_flow_map   — CUDA device function factory for RK4 integration
 CUDADispatcher           — GPU memory manager + kernel launcher (advanced use)
-make_map_kernel          — CUDA kernel factory (advanced use)
+make_map_key_kernel      — CUDA kernel factory (advanced use)
 map_parallel             — CPU parallel map loop (advanced use)
 BACKEND_PYTHON           — string constant 'python'
 BACKEND_CPU              — string constant 'cpu'
@@ -15,7 +15,7 @@ cuda_available           — runtime CUDA device check
 """
 from .accelerated_map import AcceleratedBoxMap
 from .rk4_cuda import make_cuda_rk4_flow_map
-from .gpu_backend import CUDADispatcher, make_map_kernel
+from .gpu_backend import CUDADispatcher, make_map_key_kernel
 from .cpu_backend import map_parallel
 from .backends import (
     BACKEND_PYTHON,
@@ -31,7 +31,7 @@ __all__ = [
     "AcceleratedBoxMap",
     "make_cuda_rk4_flow_map",
     "CUDADispatcher",
-    "make_map_kernel",
+    "make_map_key_kernel",
     "map_parallel",
     "BACKEND_PYTHON",
     "BACKEND_CPU",

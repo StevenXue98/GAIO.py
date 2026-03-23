@@ -1,0 +1,68 @@
+{
+  "config": {
+    "steps": 16,
+    "grid_res": 4,
+    "test_pts": 4,
+    "python_backends": [
+      "numba",
+      "numba-cuda"
+    ],
+    "no_julia": false,
+    "julia_backends": [
+      "cpu",
+      "gpu"
+    ],
+    "julia_exec": null,
+    "julia_project": "/root/gaio_bench_env",
+    "n_trials": 3,
+    "n_warmup": 2,
+    "setup_julia": false,
+    "json": "results/phase3_vs_julia.json"
+  },
+  "results": [
+    {
+      "impl": "numba",
+      "n_threads": 60,
+      "n_cells": 562636,
+      "map_time": 17.943939281976782,
+      "t_op_time": 11.461639730958268,
+      "total_time": 29.40557901293505,
+      "nnz": 3327612,
+      "note": "",
+      "error": null
+    },
+    {
+      "impl": "numba-cuda",
+      "n_threads": 1,
+      "n_cells": 562636,
+      "map_time": 5.138054207083769,
+      "t_op_time": 6.9308908300008625,
+      "total_time": 12.068945037084632,
+      "nnz": 3327612,
+      "note": "",
+      "error": null
+    },
+    {
+      "impl": "julia-default",
+      "n_threads": 60,
+      "n_cells": 562636,
+      "map_time": 22.076572571,
+      "t_op_time": 12.959794914,
+      "total_time": 35.036367485,
+      "nnz": 3327612,
+      "note": "",
+      "error": null
+    },
+    {
+      "impl": "julia-cuda",
+      "n_threads": 60,
+      "n_cells": 562636,
+      "map_time": 7.871657304,
+      "t_op_time": 10.682578103,
+      "total_time": 18.554235407,
+      "nnz": 3327612,
+      "note": "GPU map + CPU T_op (GPU construct_transfers nnz=0 bug)",
+      "error": null
+    }
+  ]
+}

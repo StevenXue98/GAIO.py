@@ -163,23 +163,28 @@ def _build_transitions(
         local_cols = np.empty(0, I64)
         local_vals = np.empty(0, F64)
     else:
-        # ── Stage 1: generate (local_K × M) test points ──────────────────────
-        # Build a temporary BoxSet view with only the local keys so we can
-        # call partition.centers() efficiently via the boxset helper.
-        from gaio.core.boxset import BoxSet as _BoxSet
-        local_bs  = _BoxSet(domain.partition, local_domain_keys)
-        centers   = local_bs.centers()          # (local_K, ndim)
+        # ── Stages 1–3: test-point generation, map, key lookup ───────────────
+        # GPU path: key-based dispatch — no float64 coordinate round-trip.
+        # CPU / Python path: coordinate-based (unchanged).
+        _gpu_backend = (
+            hasattr(F, 'backend') and F.backend == 'gpu'
+            and hasattr(F, '_gpu_dispatch')
+        )
+        if _gpu_backend:
+            # Keys in, keys out — unit_pts cached on device, no test_pts array.
+            hit_keys = F._gpu_dispatch(local_domain_keys, domain.partition)
+        else:
+            from gaio.core.boxset import BoxSet as _BoxSet
+            local_bs = _BoxSet(domain.partition, local_domain_keys)
+            centers  = local_bs.centers()
 
-        test_pts = (
-            centers[:, np.newaxis, :]
-            + unit_pts[np.newaxis, :, :] * cell_r_dom[np.newaxis, np.newaxis, :]
-        ).reshape(local_K * M, ndim)             # (local_K*M, ndim) C-contiguous
+            test_pts = (
+                centers[:, np.newaxis, :]
+                + unit_pts[np.newaxis, :, :] * cell_r_dom[np.newaxis, np.newaxis, :]
+            ).reshape(local_K * M, ndim)
 
-        # ── Stage 2: apply map — GPU kernel if F is AcceleratedBoxMap ────────
-        mapped = F._apply_map(test_pts)          # (local_K*M, ndim)
-
-        # ── Stage 3: vectorised key lookup + local COO assembly ──────────────
-        hit_keys = codomain.partition.point_to_key_batch(mapped)   # (local_K*M,)
+            mapped   = F._apply_map(test_pts)
+            hit_keys = codomain.partition.point_to_key_batch(mapped)
         cod_keys = codomain._keys                # sorted int64, shape (m,)
         m_cod    = len(cod_keys)
 

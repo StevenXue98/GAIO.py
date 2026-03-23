@@ -407,7 +407,7 @@ class TestGPUBackend:
     def test_cuda_dispatcher_grid_dims(self):
         """Verify block/grid arithmetic covers all N work items."""
         from gaio.cuda.gpu_backend import CUDADispatcher
-        disp = CUDADispatcher(_f_device_scale, threads_per_block=256)
+        disp = CUDADispatcher(_f_device_scale, UNIT_PTS_4, threads_per_block=256)
         for N in [1, 255, 256, 257, 1024, 65536, 65537]:
             bpg, tpb = disp._grid_dims(N)
             assert bpg * tpb >= N, f"Grid too small for N={N}"
@@ -416,9 +416,9 @@ class TestGPUBackend:
     def test_cuda_dispatcher_invalid_tpb_raises(self):
         from gaio.cuda.gpu_backend import CUDADispatcher
         with pytest.raises(ValueError, match="multiple of 32"):
-            CUDADispatcher(_f_device_scale, threads_per_block=100)
+            CUDADispatcher(_f_device_scale, UNIT_PTS_4, threads_per_block=100)
 
     def test_cuda_dispatcher_tpb_over_max_raises(self):
         from gaio.cuda.gpu_backend import CUDADispatcher
         with pytest.raises(ValueError, match="maximum"):
-            CUDADispatcher(_f_device_scale, threads_per_block=2048)
+            CUDADispatcher(_f_device_scale, UNIT_PTS_4, threads_per_block=2048)

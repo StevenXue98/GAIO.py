@@ -1,0 +1,86 @@
+{
+  "moderate": [
+    {
+      "frame": 0,
+      "label": "Phase 4 (static Morton)",
+      "n_cells": 1164,
+      "t_op_time": 0.004660116974264383,
+      "nnz": 3594,
+      "total_nnz_raw": 8419,
+      "per_rank_nnz": [
+        0,
+        593,
+        1294,
+        1314,
+        1304,
+        1305,
+        1304,
+        1305
+      ],
+      "imbalance": -1.0,
+      "error": null
+    },
+    {
+      "frame": 1,
+      "label": "Phase 5 (weighted split)",
+      "n_cells": 1164,
+      "t_op_time": 0.008139677927829325,
+      "nnz": 3594,
+      "total_nnz_raw": 8419,
+      "per_rank_nnz": [
+        1052,
+        1051,
+        1053,
+        1053,
+        1052,
+        1053,
+        1052,
+        1053
+      ],
+      "imbalance": 1.0019029495718363,
+      "error": null
+    }
+  ],
+  "extreme": [
+    {
+      "frame": 0,
+      "label": "Phase 4 (static Morton)",
+      "n_cells": 960,
+      "t_op_time": 0.003929398953914642,
+      "nnz": 2785,
+      "total_nnz_raw": 6542,
+      "per_rank_nnz": [
+        0,
+        68,
+        1078,
+        1080,
+        1077,
+        1080,
+        1079,
+        1080
+      ],
+      "imbalance": -1.0,
+      "error": null
+    },
+    {
+      "frame": 1,
+      "label": "Phase 5 (weighted split)",
+      "n_cells": 960,
+      "t_op_time": 0.0075302800396457314,
+      "nnz": 2785,
+      "total_nnz_raw": 6542,
+      "per_rank_nnz": [
+        813,
+        819,
+        819,
+        816,
+        819,
+        818,
+        819,
+        819
+      ],
+      "imbalance": 1.007380073800738,
+      "error": null
+    }
+  ]
+}

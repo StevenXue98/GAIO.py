@@ -390,3 +390,81 @@ statistical significance.
 | `slepc4py` not found | SLEPc optional dependency absent | `conda install -c conda-forge petsc4py slepc4py`; fallback to scipy ARPACK is automatic |
 | Rank segfaults at MPI_Init | CUDA context not created before MPI calls | Call `cuda.select_device(rank())` before any GAIO computation |
 | `ompi_info` shows no `cuda` in MPI extensions | Wrong mpirun on PATH | Confirm `which mpirun` points to `/usr/mpi/gcc/openmpi-4.1.7rc1/bin/mpirun` |
+
+---
+
+## 8. Known GAIO.jl Bugs Affecting Benchmarks
+
+These bugs were identified while developing `benchmark_vs_julia.py` and the
+Julia benchmark harness.  The workarounds are already implemented in
+`gaio_julia_benchmark.jl`; this section documents the root cause for
+reference if/when the upstream GAIO.jl source is patched.
+
+### Bug 1 — `construct_transfers` GPU path always returns nnz=0
+
+**File:** `GAIO.jl/ext/CUDAExt.jl`, function `construct_transfers`, line 85
+
+**Symptom:** `TransferOperator(F_gpu, A, A).mat` has `nnz == 0` regardless
+of the attractor size.  The GPU map (`relative_attractor`) works correctly;
+only `construct_transfers` is affected.
+
+**Root cause — variable shadowing:**
+
+```julia
+function construct_transfers(
+        g::GPUSampledBoxMap, domain::BoxSet{R,Q,S}, codomain::BoxSet{U,H,W}; ...
+    ) where {N,T,R<:Box{N,T},Q,S,U,H,W}
+    ...
+    mat = D()
+    codomain = BoxSet(P2, S())   # ← BUG: shadows the function parameter `codomain`
+    ...
+    for i in 1:nk*np
+        ...
+        hit in codomain.set || continue   # ← always false: `codomain` is now empty
+        mat = mat ⊔ ((hit,key) => 1)
+    end
+```
+
+The intent was to create a fresh local accumulation set; instead, the local
+`codomain` variable **overwrites** the function parameter of the same name.
+The membership test `hit in codomain.set` then checks against an **empty**
+set, so every hit is discarded and `mat` remains empty.
+
+**Minimal fix (not yet applied upstream):**
+
+Rename the local variable so it does not shadow the parameter:
+
+```julia
+_empty_codom = BoxSet(P2, S())   # renamed: no longer shadows the parameter
+oob = out_of_bounds(P)
+while keys_left > 0
+    ...
+    for i in 1:nk*np
+        ...
+        hit in codomain.set || continue  # now checks the real codomain ✓
+        mat = mat ⊔ ((hit,key) => 1)
+    end
+end
+```
+
+**Benchmark workaround** (`gaio_julia_benchmark.jl`): when nnz=0 is detected
+for a GPU trial, the benchmark falls back to a CPU `BoxMap(:grid, ...)` for
+`TransferOperator` timing and records the note
+`"GPU map + CPU T_op (GPU construct_transfers nnz=0 bug)"` in the JSON output.
+The attractor (map) timing from the GPU path is still valid and reported.
+
+### Bug 2 — SIMD extension silently not loaded when using `--project=GAIO.jl`
+
+**Symptom:** `BoxMap(:simd, ...)` falls back to `:grid` (FLoops default)
+without error.  `Base.get_extension(GAIO, :SIMDExt)` returns `nothing`.
+
+**Root cause:** Julia's extension system requires extension triggers (`SIMD`,
+`HostCPUFeatures`) to be loaded *after* the parent package finishes
+initialising.  Running `julia --project=GAIO.jl-master` makes GAIO load SIMD
+during its own `__init__`, creating a circular dependency that silently
+prevents `SIMDExt` from activating.
+
+**Fix:** Use a thin wrapper environment that depends on both GAIO *and* SIMD
+(see §3b–3c).  Julia loads GAIO first, then loads SIMD, which correctly
+triggers `SIMDExt`.  This is the reason `--julia-project ~/gaio_bench_env` is
+required rather than pointing directly at the GAIO.jl source directory.

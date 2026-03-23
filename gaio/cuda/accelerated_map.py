@@ -167,7 +167,10 @@ class AcceleratedBoxMap:
 
         elif self.backend == BACKEND_GPU:
             from gaio.cuda.gpu_backend import CUDADispatcher
-            self._gpu_dispatch = CUDADispatcher(f_device, threads_per_block, dtype=dtype)
+            self._gpu_dispatch = CUDADispatcher(
+                f_device, self._unit_points,
+                threads_per_block=threads_per_block, dtype=dtype,
+            )
 
     # ------------------------------------------------------------------
     # Properties (mirror SampledBoxMap interface)
@@ -195,23 +198,18 @@ class AcceleratedBoxMap:
         """
         Compute the outer-approximation image of *source*.
 
-        The three-stage pipeline is identical to SampledBoxMap.map_boxes.
-        Only Stage 2 differs by backend:
+        GPU path (key-based, no coordinate round-trip)::
 
-        Stage 1 — test-point generation (NumPy broadcast, always)::
+            in_keys  = source._keys                    (K,) int64
+            out_keys = CUDADispatcher(in_keys, P)      (K*M,) int64
+            — kernel decodes key → test point, applies f_device,
+              encodes output point → key, all on-device.
 
-            test_pts[k, m] = centers[k] + unit_pts[m] * cell_r
-            shape: (K*M, n)   C-contiguous float64
+        CPU / Python path (coordinate-based, unchanged)::
 
-        Stage 2 — map application (backend-dependent)::
-
-            python  → Python for-loop (identical to SampledBoxMap)
-            cpu     → map_parallel(f_jit, test_pts)  [prange, Numba]
-            gpu     → CUDADispatcher(test_pts)        [@cuda.jit kernel]
-
-        Stage 3 — partition key lookup (NumPy, always)::
-
-            hit_keys = partition.point_to_key_batch(mapped)
+            Stage 1: test_pts = centers + unit_pts * cell_r   (K*M, n) float64
+            Stage 2: mapped   = map_parallel / Python loop
+            Stage 3: hit_keys = partition.point_to_key_batch(mapped)
 
         Parameters
         ----------
@@ -226,6 +224,13 @@ class AcceleratedBoxMap:
         if len(source) == 0:
             return BoxSet.empty(P)
 
+        # ── GPU path: keys in, keys out — no float64 coordinate transfer ─
+        if self.backend == BACKEND_GPU:
+            out_keys = self._gpu_dispatch(source._keys, P)
+            valid = out_keys[out_keys >= 0]
+            return BoxSet(P, np.unique(valid).astype(I64))
+
+        # ── CPU / Python path ─────────────────────────────────────────────
         unit_pts = self._unit_points     # (M, n)
         cell_r   = P.cell_radius         # (n,)
         centers  = source.centers()      # (K, n)
@@ -233,18 +238,14 @@ class AcceleratedBoxMap:
         M = self.n_test_points
         n = P.ndim
 
-        # ── Stage 1: generate test points (unchanged from SampledBoxMap) ─
         test_pts = (
             centers[:, np.newaxis, :]
             + unit_pts[np.newaxis, :, :] * cell_r[np.newaxis, np.newaxis, :]
-        ).reshape(K * M, n)             # (K*M, n) C-contiguous float64
+        ).reshape(K * M, n)
 
-        # ── Stage 2: apply map — backend-dependent ─────────────────────
-        mapped = self._apply_map(test_pts)
-
-        # ── Stage 3: partition key lookup (unchanged from SampledBoxMap) ─
+        mapped   = self._apply_map(test_pts)
         hit_keys = P.point_to_key_batch(mapped)
-        valid = hit_keys[hit_keys >= 0]
+        valid    = hit_keys[hit_keys >= 0]
         return BoxSet(P, np.unique(valid).astype(I64))
 
     def _apply_map(self, test_pts: NDArray[F64]) -> NDArray[F64]:

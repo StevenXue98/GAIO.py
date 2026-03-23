@@ -1,0 +1,30 @@
+{
+  "n_ranks": 4,
+  "steps": 16,
+  "grid_res": 4,
+  "test_pts": 4,
+  "backend": "gpu",
+  "rdma": "not checked",
+  "serial": {
+    "attractor_time": 5.872911439044401,
+    "transfer_time": 7.009355240035802,
+    "eigs_time": 0.0,
+    "n_cells": 562636,
+    "nnz": 3327612
+  },
+  "distributed": {
+    "attractor_time": 4.477456087945029,
+    "transfer_time": 3.48852071701549,
+    "eigs_time": 0.0,
+    "n_cells": 562636,
+    "nnz": 3327612,
+    "per_rank_nnz": [
+      7463085,
+      8809144,
+      7599240,
+      8814883
+    ],
+    "imbalance": 1.1811312614019538
+  },
+  "speedup": 1.6171609577193653
+}

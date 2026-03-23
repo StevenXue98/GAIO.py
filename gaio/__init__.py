@@ -33,7 +33,7 @@ from .graph import BoxGraph
 from .cuda import (
     AcceleratedBoxMap,
     CUDADispatcher,
-    make_map_kernel,
+    make_map_key_kernel,
     map_parallel,
     BACKEND_PYTHON, BACKEND_CPU, BACKEND_GPU,
     cuda_available, numba_available,
@@ -54,7 +54,7 @@ __all__ = [
     "finite_time_lyapunov_exponents",
     # Phase 3 — heterogeneous acceleration
     "AcceleratedBoxMap",
-    "CUDADispatcher", "make_map_kernel", "map_parallel",
+    "CUDADispatcher", "make_map_key_kernel", "map_parallel",
     "BACKEND_PYTHON", "BACKEND_CPU", "BACKEND_GPU",
     "cuda_available", "numba_available",
 ]
