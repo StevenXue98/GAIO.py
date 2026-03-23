@@ -117,7 +117,71 @@ echo "=== Setup complete.  Run verification steps below ==="
 
 ---
 
-## 3. Verification Checklist
+## 3. Julia Setup (for `benchmark_vs_julia.py`)
+
+> **Skip this section** if you only need the GAIO.py benchmarks (Phases 3–5).
+> Julia is required only for the side-by-side GAIO.py vs GAIO.jl comparison.
+
+### 3a. Install Julia
+
+```bash
+# Download Julia 1.10 LTS (adjust version as needed)
+JULIA_VERSION=1.10.8
+wget -q "https://julialang-s3.julialang.org/bin/linux/x64/1.10/julia-${JULIA_VERSION}-linux-x86_64.tar.gz" \
+    -O /tmp/julia.tar.gz
+tar -xzf /tmp/julia.tar.gz -C "$HOME"
+
+# Add to PATH permanently
+echo "export PATH=\"\$HOME/julia-${JULIA_VERSION}/bin:\$PATH\"" >> ~/.bashrc
+export PATH="$HOME/julia-${JULIA_VERSION}/bin:$PATH"
+
+julia --version    # should print: julia version 1.10.x
+```
+
+### 3b. Instantiate the GAIO.jl project
+
+The GAIO.jl reference project lives in `references/GAIO.jl-master/`.
+`Pkg.instantiate()` downloads and precompiles all its declared dependencies:
+
+```bash
+cd ~/GAIO.py
+julia --project=references/GAIO.jl-master -e 'using Pkg; Pkg.instantiate()'
+# Takes ~2–5 min on first run; subsequent runs are instant.
+```
+
+### 3c. Install benchmark-specific Julia deps (SIMD + CUDA)
+
+`benchmark_vs_julia.py --setup-julia` adds `SIMD.jl` (fastest CPU backend,
+~2× over FLoops) and `CUDA.jl` (GPU backend) to the GAIO.jl project:
+
+```bash
+python benchmarks/benchmark_vs_julia.py --setup-julia
+# SIMD.jl: ~30 s   CUDA.jl: ~5–10 min (large package, precompiles GPU kernels)
+```
+
+After this, the benchmark is ready:
+
+```bash
+python benchmarks/benchmark_vs_julia.py    # full 4-row table (README config)
+```
+
+### Full Julia setup one-liner
+
+```bash
+JULIA_VERSION=1.10.8 && \
+wget -q "https://julialang-s3.julialang.org/bin/linux/x64/1.10/julia-${JULIA_VERSION}-linux-x86_64.tar.gz" \
+    -O /tmp/julia.tar.gz && \
+tar -xzf /tmp/julia.tar.gz -C "$HOME" && \
+export PATH="$HOME/julia-${JULIA_VERSION}/bin:$PATH" && \
+echo "export PATH=\"\$HOME/julia-${JULIA_VERSION}/bin:\$PATH\"" >> ~/.bashrc && \
+julia --project="$HOME/GAIO.py/references/GAIO.jl-master" \
+    -e 'using Pkg; Pkg.instantiate()' && \
+python "$HOME/GAIO.py/benchmarks/benchmark_vs_julia.py" --setup-julia
+```
+
+---
+
+## 4. Python Verification Checklist
 
 Run these after the setup script finishes, in the activated `gaio` conda env:
 
@@ -195,7 +259,7 @@ EOF
 
 ---
 
-## 4. Running the Benchmarks
+## 5. Running the Benchmarks
 
 ### Phase 3 — single-GPU acceleration (baseline, no mpirun needed)
 
@@ -240,7 +304,7 @@ mpirun -n 4 --bind-to socket \
 
 ---
 
-## 5. Instance Type Selection Guide
+## 6. Instance Type Selection Guide
 
 | Benchmark goal | Recommended instance | Notes |
 |---|---|---|
@@ -255,7 +319,7 @@ statistical significance.
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|

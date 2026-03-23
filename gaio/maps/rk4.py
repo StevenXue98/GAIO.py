@@ -163,15 +163,33 @@ def make_njit_rk4_flow_map(vfield_jit, step_size: float = 0.01, steps: int = 20)
             "Install with: conda install numba"
         ) from exc
 
-    @numba.njit
+    @numba.njit(fastmath=True, cache=True)
     def flow(x):
+        n = x.shape[0]
         state = x.copy()
+        # Pre-allocate k-stage buffers once per call — reused across all
+        # RK4 steps.  Avoids 4 × steps heap allocations that Julia sidesteps
+        # with stack-allocated SVector{N,T}.
+        k1 = np.empty(n)
+        k2 = np.empty(n)
+        k3 = np.empty(n)
+        k4 = np.empty(n)
+        tmp = np.empty(n)
+        h2 = step_size * 0.5
+        h6 = step_size / 6.0
         for _ in range(steps):
-            k1 = vfield_jit(state)
-            k2 = vfield_jit(state + (step_size * 0.5) * k1)
-            k3 = vfield_jit(state + (step_size * 0.5) * k2)
-            k4 = vfield_jit(state + step_size * k3)
-            state = state + (step_size / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+            k1[:] = vfield_jit(state)
+            for i in range(n):
+                tmp[i] = state[i] + h2 * k1[i]
+            k2[:] = vfield_jit(tmp)
+            for i in range(n):
+                tmp[i] = state[i] + h2 * k2[i]
+            k3[:] = vfield_jit(tmp)
+            for i in range(n):
+                tmp[i] = state[i] + step_size * k3[i]
+            k4[:] = vfield_jit(tmp)
+            for i in range(n):
+                state[i] += h6 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i])
         return state
 
     return flow

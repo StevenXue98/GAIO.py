@@ -73,7 +73,7 @@ def _build_parallel_kernel():
     numba = _get_numba()
     prange = numba.prange
 
-    @numba.njit(parallel=True)
+    @numba.njit(parallel=True, fastmath=True, cache=True)
     def _map_loop_parallel(f_jit, test_pts, mapped):
         """
         Apply f_jit to each row of test_pts in parallel.
