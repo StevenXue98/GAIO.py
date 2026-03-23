@@ -95,9 +95,10 @@ def _four_wing_v(x: np.ndarray) -> np.ndarray:
     ])
 
 
-def _unit_pts(res: int = 3) -> np.ndarray:
-    t = np.linspace(-0.5, 0.5, res)
-    gx, gy, gz = np.meshgrid(t, t, t)
+def _unit_pts(res: int = 4) -> np.ndarray:
+    """Grid of test points matching GAIO.jl GridBoxMap: k*(2/n)-1 for k=0..n-1."""
+    t = np.arange(res, dtype=float) * (2.0 / res) - 1.0
+    gx, gy, gz = np.meshgrid(t, t, t, indexing="ij")
     return np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
 
 
@@ -152,7 +153,7 @@ def _make_cpu_map(domain, unit_pts):
                              f_jit=f_jit, backend="cpu")
 
 
-def _make_gpu_map(domain, unit_pts):
+def _make_gpu_map(domain, unit_pts, dtype=None):
     from numba import cuda
     from gaio import rk4_flow_map, AcceleratedBoxMap
     from gaio.cuda.rk4_cuda import make_cuda_rk4_flow_map
@@ -166,7 +167,7 @@ def _make_gpu_map(domain, unit_pts):
     f_cpu    = rk4_flow_map(_four_wing_v, step_size=0.01, steps=20)
     f_device = make_cuda_rk4_flow_map(_fw_device, ndim=3, step_size=0.01, steps=20)
     return AcceleratedBoxMap(f_cpu, domain, unit_pts,
-                             f_device=f_device, backend="gpu")
+                             f_device=f_device, backend="gpu", dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +181,7 @@ def _run_backend(
     P,
     steps: int,
     comm=None,
+    gpu_dtype=None,
 ) -> BenchResult:
     """Run the full pipeline for one backend; return a BenchResult."""
     from gaio import BoxSet, relative_attractor, TransferOperator
@@ -193,7 +195,7 @@ def _run_backend(
         elif backend_name == "cpu":
             F = _make_cpu_map(domain, unit_pts)
         elif backend_name in ("gpu", "mpi-gpu"):
-            F = _make_gpu_map(domain, unit_pts)
+            F = _make_gpu_map(domain, unit_pts, dtype=gpu_dtype)
         else:
             raise ValueError(f"Unknown backend: {backend_name}")
     except Exception as exc:
@@ -299,6 +301,8 @@ def main(argv=None):
                         choices=["python", "cpu", "gpu"],
                         default=["python", "cpu", "gpu"],
                         help="Backends to benchmark")
+    parser.add_argument("--float32", action="store_true",
+                        help="Force float32 on GPU kernel (default: auto-detect; A100 uses float64)")
     parser.add_argument("--json", type=str, default=None,
                         help="Save results to JSON file")
     args = parser.parse_args(argv)
@@ -350,7 +354,9 @@ def main(argv=None):
             continue
 
         print(f"  Running '{backend}' …", end="", flush=True)
-        result = _run_backend(backend, domain, upts, P, args.steps, comm=None)
+        gpu_dtype = np.float32 if args.float32 else None
+        result = _run_backend(backend, domain, upts, P, args.steps, comm=None,
+                              gpu_dtype=gpu_dtype)
         results.append(result)
 
         if result.error:

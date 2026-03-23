@@ -371,8 +371,8 @@ def main(argv=None):
 
     domain   = Box(np.array([0.0, 0.0, 0.0]), np.array([5.0, 5.0, 5.0]))
     P        = BoxPartition(domain, [args.grid_res] * 3)
-    t_pts    = np.linspace(-0.5, 0.5, args.test_pts)
-    gx, gy, gz = np.meshgrid(t_pts, t_pts, t_pts)
+    t_pts    = np.arange(args.test_pts, dtype=float) * (2.0 / args.test_pts) - 1.0
+    gx, gy, gz = np.meshgrid(t_pts, t_pts, t_pts, indexing="ij")
     unit_pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
     M        = len(unit_pts)
     S        = BoxSet.full(P)

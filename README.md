@@ -470,17 +470,14 @@ to single-GPU usage.
 
 > Run with `python benchmarks/benchmark_phase3.py --steps 10 --grid-res 2` (single GPU).
 > Hardware: NVIDIA A100 SXM4 40 GB, 30-core CPU (Lambda Cloud `gpu_1x_a100`).
-> Test points: 4³ = 64 per cell (matches GAIO.jl `GridBoxMap` default).
-> Python/CPU/GPU: 4,046 cells, nnz=15,240. GAIO.jl: 4,687 cells, nnz=27,391 (different
-> test-point placement — Julia's GridBoxMap places points at cell-face midpoints vs. Python's
-> interior linspace; both are valid outer approximations).
-> GAIO.jl timed after JIT warm-up (steps=10, `BoxMap(:grid, f, P)`, Julia 1.12.5).
+> Test points: 4³ = 64 per cell using `GridMap` formula (`k*(2/n)-1`), matching GAIO.jl `GridBoxMap` exactly.
+> All backends: 4,687 cells, nnz=27,391. GAIO.jl timed after JIT warm-up (Julia 1.12.5).
 
 | Backend        | Attractor cells | Map (s) | T_op (s) | Total (s) | Speedup | GAIO.jl (s) |
 |----------------|-----------------|---------|----------|-----------|---------|-------------|
-| python         |           4,046 |  200.98 |    80.70 |    281.68 |    1.0× |           — |
-| cpu (Numba)    |           4,046 |    1.63 |     0.20 |      1.83 |  154.0× |        1.78 |
-| gpu (A100)     |           4,046 |    0.63 |     0.11 |      0.74 |  381.8× |        0.61 |
+| python         |           4,687 |  227.33 |    93.83 |    321.17 |    1.0× |           — |
+| cpu (Numba)    |           4,687 |    1.64 |     0.18 |      1.82 |  176.1× |        1.78 |
+| gpu (A100)     |           4,687 |    0.65 |     0.13 |      0.77 |  416.0× |        0.61 |
 | mpi-gpu (4×)   |             —   |     —   |      —   |       —   |     —   |         N/A |
 
 *`mpi-gpu` row requires a multi-GPU instance; run*
