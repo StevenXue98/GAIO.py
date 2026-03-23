@@ -485,8 +485,11 @@ to single-GPU usage.
 *GAIO.jl does not support multi-GPU, so that cell is N/A.*
 *GAIO.jl CPU: map=0.985 s + T\_op=0.798 s = 1.78 s (4,687 cells, nnz=27,391).*
 *GAIO.jl GPU: map=0.058 s (GPU) + T\_op=0.554 s (CPU fallback†) = 0.61 s.*
-*†GAIO.jl's `construct_transfers` GPU path has a bug (codomain rebound to empty set → nnz=0);*
+*†GAIO.jl's `construct_transfers` GPU path might contain a bug (codomain rebound to empty set → nnz=0);*
 *T\_op falls back to the CPU BoxMap. GPU accelerates only `relative_attractor` (17× vs CPU map).*
+*‡Python GPU runs in float64 on A100 (A100 has native FP64, so `detect_gpu_dtype()` keeps float64).*
+*Julia's GPU kernel is float32 end-to-end (float32 literals + parametric types propagate through compilation),*
+*likely accounting for the ~0.16 s gap between Python GPU (0.77 s) and GAIO.jl GPU (0.61 s).*
 
 ---
 
