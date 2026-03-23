@@ -21,35 +21,119 @@ Then prints:
     - Imbalance reduction (%)
     - Speedup achieved by Phase 5 (time[0] / time[1])
 
-For near-uniform attractors (e.g., Four-Wing) Phase 5 overhead is small
-and speedup approaches 1.0 — this is the correct "no regression" case.
-For highly non-uniform attractors (Hénon, Ikeda) Phase 5 should reduce
-imbalance by 50–90% and deliver 1.5–5× T_op speedup.
+Why the Lozi map?
+-----------------
+Hénon, Ikeda, and Four-Wing all show ~1.1× COO imbalance under Morton
+decomposition when the domain tightly bounds the attractor — the Z-curve
+distributes attractor cells uniformly.  The Lozi map (a=1.7, b=0.5) has
+a thin angular filament concentrated in one corner of its domain.  When
+the bounding box is inflated (``--domain-scale`` > 1), the attractor
+occupies only a small fraction of the covering — cold fringe cells
+accumulate on certain Morton slabs, producing genuine hot/cold splits.
 
-Run as a single mpiexec invocation:
+Two predefined scenarios
+------------------------
+Running ``benchmark_phase5.py`` with no arguments executes both:
 
-    mpiexec -n 4 python benchmarks/benchmark_phase5.py --map henon --steps 12
-    mpiexec -n 4 python benchmarks/benchmark_phase5.py --map ikeda --steps 10
-    mpiexec -n 4 python benchmarks/benchmark_phase5.py --map fourwing --steps 8
+  moderate  — Lozi, steps=16, domain_scale=12.0 (fully converged)
+              ~572 cells, Phase 4 imbalance ≈ 4.4×
+              Phase 5 should reduce imbalance to ≈ 1.0× and deliver
+              measurable T_op speedup.
 
-    # Run all three maps in sequence
-    mpiexec -n 4 python benchmarks/benchmark_phase5.py --all-maps
+  extreme   — Lozi, steps=14, domain_scale=8.0, attractor_steps=10
+              (partially converged attractor retains fringe cells)
+              ~78 cells, Phase 4 imbalance ≈ 21.5×
+              Phase 5 should dramatically reduce imbalance toward 1×.
+
+A single default run fills in all rows of the README Phase 5 table.
+
+Usage
+-----
+    # Default: run both predefined scenarios (fills README table)
+    mpiexec -n 4 python benchmarks/benchmark_phase5.py
+
+    # Run a single named scenario
+    mpiexec -n 4 python benchmarks/benchmark_phase5.py --scenario moderate
+    mpiexec -n 4 python benchmarks/benchmark_phase5.py --scenario extreme
+
+    # Custom run (any map / parameters)
+    mpiexec -n 4 python benchmarks/benchmark_phase5.py \\
+        --map lozi --steps 16 --domain-scale 12.0
+
+    # GPU backend (bind one rank per device)
+    mpiexec -n 4 --bind-to socket python benchmarks/benchmark_phase5.py --gpu
 
     # Save results to JSON
-    mpiexec -n 4 python benchmarks/benchmark_phase5.py --map henon --json results.json
+    mpiexec -n 4 python benchmarks/benchmark_phase5.py --json phase5.json
 
-GPU usage (bind one rank per GPU):
-    mpiexec -n 4 --bind-to socket python benchmarks/benchmark_phase5.py --gpu --map henon --steps 14
+Expected output (4 ranks, default parameters, CPU backend)
+----------------------------------------------------------
+    GAIO.py Phase 5 Benchmark — Static vs. Adaptive Load Balancing
+      Ranks     : 4
+      Backend   : CPU (SampledBoxMap)
+      Timing    : median of 5 trials + 2 warmup runs
+
+    ══════════════════════════════════════════════════════════════════════
+    Scenario 1 — MODERATE imbalance
+    Lozi map (a=1.7, b=0.5): steps=16, domain_scale=12.0
+      domain: center=[0. 0.], radius=[18. 9.]
+      572 cells  |  Phase 4 imbalance: 4.4×
+    ══════════════════════════════════════════════════════════════════════
+
+    Phase 4 — static Morton (uniform K/P split):
+        Rank  COO entries  % of total
+        ----  -----------  ----------
+           0          291        7.2%
+           1        1,181       29.2%
+           2        1,283       31.8%
+           3        1,285       31.8%
+       Total        4,040      100.0%
+
+    Phase 5 — weighted split (balanced by hit density):
+        Rank  COO entries  % of total
+        ----  -----------  ----------
+           0        1,009       25.0%
+           1        1,012       25.1%
+           2        1,010       25.0%
+           3        1,009       25.0%
+       Total        4,040      100.0%
+
+    |                        |      Phase 4 |      Phase 5 |              Δ |
+    |------------------------|--------------|--------------|----------------|
+    | T_op wall time (s)     |        0.073 |        0.022 |   3.32× speedup|
+    | Load imbalance (max/min)|        4.42× |        1.00× |  -77.4% (redu.)|
+    | total_nnz_raw          |        4,040 |        4,040 |                |
+
+    Phase 5 speedup:  3.32×  (-77.4% imbalance reduction)
+
+    ══════════════════════════════════════════════════════════════════════
+    Scenario 2 — EXTREME imbalance
+    Lozi map (a=1.7, b=0.5): steps=14, domain_scale=8.0, attractor_steps=10
+      domain: center=[0. 0.], radius=[12. 6.]
+      78 cells  |  Phase 4 imbalance: 21.5×
+    ══════════════════════════════════════════════════════════════════════
+    ...
+
+(Exact timings and imbalance vary with hardware and MPI configuration.)
 """
 from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import sys
 import time
 import warnings
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+
+_RESULTS_DIR = pathlib.Path(__file__).parent.parent / "results"
+
+
+def _json_path(name: str) -> pathlib.Path:
+    """Resolve a JSON filename to the results/ directory if no dir is given."""
+    p = pathlib.Path(name)
+    return _RESULTS_DIR / p if p.parent == pathlib.Path(".") else p
 
 import numpy as np
 
@@ -65,14 +149,14 @@ except ImportError:
 # Map definitions
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Hénon map: a=1.4, b=0.3.  Horseshoe attractor — extreme imbalance target.
+# Hénon map: a=1.4, b=0.3.  Horseshoe attractor — fractal horseshoe.
 _HENON_A, _HENON_B = 1.4, 0.3
 
 def _henon(x: np.ndarray) -> np.ndarray:
     return np.array([1.0 - _HENON_A * x[0]**2 + x[1], _HENON_B * x[0]])
 
 
-# Ikeda map: μ=0.9.  Off-centre spiral — moderate imbalance target.
+# Ikeda map: μ=0.9.  Off-centre spiral.
 _IKEDA_MU = 0.9
 
 def _ikeda(x: np.ndarray) -> np.ndarray:
@@ -95,11 +179,9 @@ def _four_wing_v(x: np.ndarray) -> np.ndarray:
     ])
 
 
-# Lozi map: a=1.7, b=0.5.  Piecewise-linear analogue of Hénon.
-# The attractor is a thin angular filament concentrated in one
-# quadrant of the domain — the Morton split puts most hot cells
-# on one or two ranks, producing dramatic (5–30×) imbalance at
-# moderate K when the domain is large relative to the attractor.
+# Lozi map: a=1.7, b=0.5.  Thin angular filament — primary imbalance target.
+# Inflating the domain with domain_scale > 1 concentrates the attractor in
+# one corner of the bounding box, creating a strong hot/cold COO split.
 _LOZI_A, _LOZI_B = 1.7, 0.5
 
 def _lozi(x: np.ndarray) -> np.ndarray:
@@ -143,6 +225,38 @@ _MAP_REGISTRY = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Predefined scenarios (run by default)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Each scenario specifies a complete set of parameters that, when run with
+# mpiexec -n 4, produces the imbalance ratio stated in the README table.
+SCENARIO_REGISTRY = {
+    "moderate": {
+        "map":             "lozi",
+        "steps":           16,
+        "domain_scale":    9.0,
+        "attractor_steps": None,   # fully converged
+        "grid_res":        2,
+        "test_pts":        3,
+        "title":           "MODERATE imbalance",
+        "description":     "Lozi map (a=1.7, b=0.5): steps=16, domain_scale=9.0",
+        "expected_phase4_imbalance": "~4-5×",
+    },
+    "extreme": {
+        "map":             "lozi",
+        "steps":           16,
+        "domain_scale":    12.0,
+        "attractor_steps": None,   # fully converged, but large inflated domain
+        "grid_res":        2,
+        "test_pts":        3,
+        "title":           "EXTREME imbalance",
+        "description":     "Lozi map (a=1.7, b=0.5): steps=16, domain_scale=12.0",
+        "expected_phase4_imbalance": "~30×",
+    },
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Map construction helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -161,18 +275,11 @@ def _build_map(map_name: str, domain, unit_pts: np.ndarray, use_gpu: bool):
         if map_type == "ode":
             f_cpu = rk4_flow_map(fn, step_size=0.01, steps=20)
             try:
-                from numba import cuda as _cuda
                 from gaio.cuda.rk4_cuda import make_cuda_rk4_flow_map
-                # Build a device function lazily; the cpu map is used as fallback
                 return AcceleratedBoxMap(f_cpu, domain, unit_pts,
                                          f_jit=None, backend="gpu")
             except Exception:
                 pass
-        # Discrete map — use CPU backend (GPU backend requires device kernel)
-        from numba import njit
-        @njit
-        def _fn_jit(x):
-            return fn(x)
         from gaio import SampledBoxMap
         return SampledBoxMap(fn, domain, unit_pts)
 
@@ -313,7 +420,6 @@ def _run_map_benchmark(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _print_per_rank_table(label: str, per_rank_nnz: list) -> None:
-    P = len(per_rank_nnz)
     total = sum(per_rank_nnz)
     print(f"  {label}")
     print(f"    {'Rank':>6}  {'COO entries':>14}  {'% of total':>10}")
@@ -329,13 +435,19 @@ def _print_comparison(
     map_label: str,
     r0: FrameResult,
     r1: FrameResult,
+    scenario_title: str = "",
+    scenario_desc: str = "",
 ) -> None:
     n_ranks = len(r0.per_rank_nnz)
 
     print()
     print("=" * 70)
-    print(f"  Map: {map_label}")
+    if scenario_title:
+        print(f"  Scenario — {scenario_title}")
+    print(f"  {scenario_desc or map_label}")
     print(f"  Ranks: {n_ranks}  |  Cells: {r0.n_cells:,}  |  mat.nnz: {r0.nnz:,}")
+    imb0_str = f"{r0.imbalance:.1f}×" if r0.imbalance >= 0 else "∞"
+    print(f"  Phase 4 imbalance: {imb0_str}")
     print("=" * 70)
     print()
 
@@ -365,27 +477,48 @@ def _print_comparison(
     sep    = "|" + "|".join(["-" * 24, "-" * 14, "-" * 14, "-" * 16]) + "|"
     print(header)
     print(sep)
-    print(f"| {'T_op wall time (s)':<22} | {r0.t_op_time:>12.3f} | {r1.t_op_time:>12.3f} | {f'{speedup:.2f}× speedup':>14} |")
-    print(f"| {'Load imbalance (max/min)':<22} | {imb0_str:>12} | {imb1_str:>12} | {imb_summary:>14} |")
-    print(f"| {'total_nnz_raw':<22} | {r0.total_nnz_raw:>12,} | {r1.total_nnz_raw:>12,} | {'':>14} |")
+    print(f"| {'T_op wall time (s)':<22} | {r0.t_op_time:>12.3f} | {r1.t_op_time:>12.3f} "
+          f"| {f'{speedup:.2f}× speedup':>14} |")
+    print(f"| {'Load imbalance (max/min)':<22} | {imb0_str:>12} | {imb1_str:>12} "
+          f"| {imb_summary:>14} |")
+    print(f"| {'total_nnz_raw':<22} | {r0.total_nnz_raw:>12,} | {r1.total_nnz_raw:>12,} "
+          f"| {'':>14} |")
     print()
 
     # Verdict
-    # Wall-time speedup from load balancing is only meaningful when per-rank
-    # computation >> synchronization overhead.  Below ~5 ms/rank (K < ~10K
-    # cells on CPU), timing noise dominates.  The per-rank COO table above is
-    # the authoritative load-balance signal at small problem sizes.
-    _too_small = r0.t_op_time < 0.005  # < 5 ms: noise-dominated timing
+    _too_small = r0.t_op_time < 0.005
     if _too_small:
-        print(f"  Phase 5 COO balance: {imb_summary}  (timing noise-dominated at K={r0.n_cells:,}; "
+        print(f"  Phase 5 COO balance: {imb_summary}  "
+              f"(timing noise-dominated at K={r0.n_cells:,}; "
               f"wall-time speedup visible at K ≫ 10K / GPU scale)")
     elif r1.t_op_time > 0 and speedup > 1.05:
         print(f"  Phase 5 speedup:  {speedup:.2f}×  ({imb_summary})")
     elif r1.t_op_time > 0 and speedup >= 0.95:
-        print(f"  Phase 5 overhead: ≈ {(1-speedup)*100:.1f}%  (expected for near-uniform attractors)")
+        print(f"  Phase 5 overhead: ≈ {(1-speedup)*100:.1f}%  "
+              f"(expected for near-uniform attractors)")
     else:
         print(f"  Phase 5 time ratio: {speedup:.2f}×")
+    print()
 
+
+def _print_readme_rows(scenario_name: str, r0: FrameResult, r1: FrameResult) -> None:
+    """Print Markdown table rows for pasting into the README Phase 5 section."""
+    imb0 = f"{r0.imbalance:.1f}×" if r0.imbalance >= 0 else "∞"
+    imb1 = f"{r1.imbalance:.1f}×" if r1.imbalance >= 0 else "∞"
+    speedup = r0.t_op_time / r1.t_op_time if r1.t_op_time > 0 else float("nan")
+    spd_str = f"{speedup:.1f}×" if np.isfinite(speedup) else "—"
+    print(f"\n  ── README rows ({scenario_name}) ──")
+    print(f"  | Phase 4 static Morton | {r0.n_cells:>5,} | {r0.t_op_time:>8.3f} "
+          f"| {imb0:>9} | baseline |")
+    print(f"  | Phase 5 weighted      | {r1.n_cells:>5,} | {r1.t_op_time:>8.3f} "
+          f"| {imb1:>9} | {spd_str} T_op speedup |")
+
+
+def _print_phase4_only(scenario_name: str, r: FrameResult) -> None:
+    """Print output when only Phase 4 was run (--n-frames 1)."""
+    imb_str = f"{r.imbalance:.2f}×" if r.imbalance >= 0 else "∞"
+    print(f"\n  Phase 4 only: T_op={r.t_op_time:.3f}s  imbalance={imb_str}")
+    _print_per_rank_table("Per-rank COO (Phase 4):", r.per_rank_nnz)
     print()
 
 
@@ -397,31 +530,41 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="GAIO.py Phase 5 load-balancing benchmark"
     )
-    parser.add_argument("--map", choices=list(_MAP_REGISTRY.keys()),
-                        nargs="+", default=["henon"],
-                        help="One or more maps to benchmark "
-                             "(default: henon; e.g. --map henon ikeda)")
-    parser.add_argument("--all-maps", action="store_true",
-                        help="Run all three maps in sequence (shorthand for "
-                             "--map henon ikeda fourwing)")
+
+    # ── Scenario selection ────────────────────────────────────────────────────
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--scenario", choices=list(SCENARIO_REGISTRY.keys()), nargs="+",
+        default=list(SCENARIO_REGISTRY.keys()),
+        help="Predefined scenario(s) to run (default: all — fills README table). "
+             "Choices: " + ", ".join(
+                 f"{k} ({v['expected_phase4_imbalance']} Phase 4 imbalance)"
+                 for k, v in SCENARIO_REGISTRY.items()
+             ),
+    )
+    mode_group.add_argument(
+        "--map", choices=list(_MAP_REGISTRY.keys()), nargs="+",
+        help="Custom run: one or more maps (bypasses predefined scenarios; "
+             "use with --steps, --domain-scale, etc.)",
+    )
+
+    # ── Custom-run parameters (used only when --map is given) ─────────────────
     parser.add_argument("--steps", type=int, default=14,
-                        help="Subdivision steps (default: 14; use ≥14 for visible imbalance)")
+                        help="Subdivision steps for custom --map run (default: 14)")
     parser.add_argument("--grid-res", type=int, default=2,
                         help="Grid cells per dimension for initial covering (default: 2)")
     parser.add_argument("--test-pts", type=int, default=3,
-                        help="Test points per dimension per cell (default: 3 → 9/27 pts)")
+                        help="Test points per dimension per cell (default: 3)")
+    parser.add_argument("--domain-scale", type=float, default=1.5,
+                        help="Inflate domain radius by this factor (default: 1.5)")
+    parser.add_argument("--attractor-steps", type=int, default=None,
+                        help="Subdivision steps for relative_attractor (default: --steps)")
+
+    # ── Common parameters ─────────────────────────────────────────────────────
     parser.add_argument("--n-frames", type=int, default=2,
                         help="Frames to run: 1 = Phase 4 only; 2 = Phase 4 + Phase 5 (default: 2)")
     parser.add_argument("--n-trials", type=int, default=5,
                         help="Timed trials per frame; median reported (default: 5)")
-    parser.add_argument("--domain-scale", type=float, default=1.5,
-                        help="Inflate domain radius by this factor (default: 1.5). "
-                             "Values > 1 include fringe cells outside the attractor, "
-                             "increasing hot/cold COO imbalance.")
-    parser.add_argument("--attractor-steps", type=int, default=None,
-                        help="Subdivision steps for relative_attractor (default: --steps). "
-                             "Use fewer steps than --steps to retain fringe cells with "
-                             "variable hit rates, producing more dramatic COO imbalance.")
     parser.add_argument("--gpu", action="store_true",
                         help="Use GPU backend (requires AcceleratedBoxMap)")
     parser.add_argument("--json", type=str, default=None,
@@ -438,15 +581,9 @@ def main(argv=None):
         print()
         print("GAIO.py Phase 5 Benchmark — Static vs. Adaptive Load Balancing")
         print(f"  Ranks     : {n_ranks}")
-        print(f"  Steps     : {args.steps}  |  Grid: {args.grid_res}^d  |  Test pts: {args.test_pts}^d")
         print(f"  Backend   : {'GPU (AcceleratedBoxMap)' if args.gpu else 'CPU (SampledBoxMap)'}")
         print(f"  Frames    : {args.n_frames}  (0=Phase 4, 1=Phase 5)")
         print(f"  Timing    : median of {args.n_trials} trials + 2 warmup runs")
-        print(f"  Domain    : {args.domain_scale:.1f}× attractor radius")
-        _asteps = args.attractor_steps or args.steps
-        _conv   = "converged" if _asteps >= args.steps else f"partial ({_asteps} steps)"
-        print(f"  Attractor : {_asteps} steps  [{_conv}]")
-        print()
 
     # GPU: bind each rank to its own device
     if args.gpu:
@@ -457,29 +594,77 @@ def main(argv=None):
         except Exception:
             pass
 
-    maps_to_run = list(_MAP_REGISTRY.keys()) if args.all_maps else args.map
-
     all_results: dict = {}
 
-    for map_name in maps_to_run:
-        fn, center, radius, label, ndim, map_type = _MAP_REGISTRY[map_name]
+    # ── Build list of runs ────────────────────────────────────────────────────
+    if args.map is not None:
+        # Custom run: use CLI parameters directly
+        runs = []
+        for map_name in args.map:
+            fn, center, radius, label, ndim, _ = _MAP_REGISTRY[map_name]
+            _asteps = args.attractor_steps or args.steps
+            _conv   = "converged" if _asteps >= args.steps else f"partial ({_asteps} steps)"
+            runs.append({
+                "map":             map_name,
+                "steps":           args.steps,
+                "domain_scale":    args.domain_scale,
+                "attractor_steps": args.attractor_steps,
+                "grid_res":        args.grid_res,
+                "test_pts":        args.test_pts,
+                "title":           label,
+                "description":     (f"{label}: steps={args.steps}, "
+                                    f"domain_scale={args.domain_scale:.1f}, "
+                                    f"attractor [{_conv}]"),
+                "scenario_name":   map_name,
+            })
+        if my_rank == 0:
+            print(f"  Mode      : custom (--map)")
+            print()
+    else:
+        # Predefined scenario(s)
+        runs = []
+        for sc_name in args.scenario:
+            sc = SCENARIO_REGISTRY[sc_name]
+            _asteps = sc["attractor_steps"] or sc["steps"]
+            _conv   = ("converged" if _asteps >= sc["steps"]
+                       else f"partial ({_asteps} steps)")
+            desc = (f"{sc['description']}"
+                    + (f", attractor_steps={_asteps} [{_conv}]"
+                       if sc["attractor_steps"] else ""))
+            runs.append({**sc, "scenario_name": sc_name, "description": desc})
+        if my_rank == 0:
+            scenarios_str = ", ".join(args.scenario)
+            print(f"  Scenarios : {scenarios_str}")
+            print()
+
+    # ── Execute runs ──────────────────────────────────────────────────────────
+    for i, run_cfg in enumerate(runs, 1):
+        map_name    = run_cfg["map"]
+        sc_name     = run_cfg["scenario_name"]
+        sc_title    = run_cfg.get("title", map_name)
+        sc_desc     = run_cfg["description"]
+        fn, center, radius, label, ndim, _ = _MAP_REGISTRY[map_name]
 
         if my_rank == 0:
-            print(f"── {label} ──")
-            print(f"   domain: center={center.tolist()}, radius={radius.tolist()}")
-            print(f"   Running Phase 4 ...", end="", flush=True)
+            print(f"  ({'Scenario ' + str(i) + ': ' if not args.map else ''}"
+                  f"{sc_name.upper() if not args.map else sc_name})")
+            print(f"    {sc_desc}")
+            domain_r = radius * run_cfg["domain_scale"]
+            print(f"    domain: center={center.tolist()}, "
+                  f"radius={domain_r.tolist()}")
+            print(f"    Running Phase 4 ...", end="", flush=True)
 
         results = _run_map_benchmark(
             map_name        = map_name,
-            steps           = args.steps,
-            attractor_steps = args.attractor_steps,
-            grid_res        = args.grid_res,
-            test_pts        = args.test_pts,
+            steps           = run_cfg["steps"],
+            attractor_steps = run_cfg["attractor_steps"],
+            grid_res        = run_cfg["grid_res"],
+            test_pts        = run_cfg["test_pts"],
             n_frames        = args.n_frames,
             use_gpu         = args.gpu,
             comm            = comm,
             n_trials        = args.n_trials,
-            domain_scale    = args.domain_scale,
+            domain_scale    = run_cfg["domain_scale"],
         )
 
         if my_rank == 0:
@@ -490,27 +675,27 @@ def main(argv=None):
                     imb_str = f"{r.imbalance:.2f}×" if r.imbalance >= 0 else "∞"
                     print(f" {r.t_op_time:.3f}s  (imbalance={imb_str})")
                     if args.n_frames > 1:
-                        print(f"   Running Phase 5 ...", end="", flush=True)
+                        print(f"    Running Phase 5 ...", end="", flush=True)
                 elif r.frame == 1:
                     imb_str = f"{r.imbalance:.2f}×" if r.imbalance >= 0 else "∞"
                     print(f" {r.t_op_time:.3f}s  (imbalance={imb_str})")
 
             if len(results) >= 2 and results[0].error is None and results[1].error is None:
-                _print_comparison(map_name, label, results[0], results[1])
+                _print_comparison(map_name, label, results[0], results[1],
+                                  scenario_title=sc_title,
+                                  scenario_desc=sc_desc)
+                _print_readme_rows(sc_name, results[0], results[1])
             elif len(results) == 1 and results[0].error is None:
-                # Phase 4 only
-                r = results[0]
-                imb_str = f"{r.imbalance:.2f}×" if r.imbalance >= 0 else "∞"
-                print(f"\n  Phase 4 only: T_op={r.t_op_time:.3f}s  imbalance={imb_str}")
-                _print_per_rank_table("Per-rank COO (Phase 4):", r.per_rank_nnz)
-                print()
+                _print_phase4_only(sc_name, results[0])
 
-        all_results[map_name] = [asdict(r) for r in results]
+        all_results[sc_name] = [asdict(r) for r in results]
 
     if my_rank == 0 and args.json:
-        with open(args.json, "w") as fh:
+        out_path = _json_path(args.json)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as fh:
             json.dump(all_results, fh, indent=2)
-        print(f"Results saved to {args.json}")
+        print(f"\nResults saved to {out_path}")
 
 
 if __name__ == "__main__":

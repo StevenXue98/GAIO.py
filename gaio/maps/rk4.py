@@ -126,6 +126,57 @@ def rk4_flow_map(f, step_size: float = 0.01, steps: int = 20):
     return g
 
 
+def make_njit_rk4_flow_map(vfield_jit, step_size: float = 0.01, steps: int = 20):
+    """
+    Build a ``@numba.njit`` flow map from a ``@numba.njit`` vector field.
+
+    CPU-side counterpart of :func:`gaio.cuda.rk4_cuda.make_cuda_rk4_flow_map`.
+    Pass the returned callable as ``f_jit`` to :class:`~gaio.cuda.AcceleratedBoxMap`
+    when using ``backend='cpu'``.
+
+    Parameters
+    ----------
+    vfield_jit : ``@numba.njit`` callable
+        ODE right-hand side ``v(x) → dx/dt``.  Must accept and return a 1-D
+        ``float64`` array of shape ``(n,)``.
+    step_size : float, optional
+        RK4 step size (dt).  Total integration time = ``step_size * steps``.
+    steps : int, optional
+        Number of RK4 steps.  Default: 20.
+
+    Returns
+    -------
+    ``@numba.njit`` callable
+        Flow map ``Φ^T(x)`` with the same ``(n,) → (n,)`` signature.
+        Pass this as ``f_jit`` to :class:`~gaio.cuda.AcceleratedBoxMap`.
+
+    Raises
+    ------
+    ImportError
+        If ``numba`` is not installed.
+    """
+    try:
+        import numba
+    except ImportError as exc:
+        raise ImportError(
+            "make_njit_rk4_flow_map requires the 'numba' package.  "
+            "Install with: conda install numba"
+        ) from exc
+
+    @numba.njit
+    def flow(x):
+        state = x.copy()
+        for _ in range(steps):
+            k1 = vfield_jit(state)
+            k2 = vfield_jit(state + (step_size * 0.5) * k1)
+            k3 = vfield_jit(state + (step_size * 0.5) * k2)
+            k4 = vfield_jit(state + step_size * k3)
+            state = state + (step_size / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        return state
+
+    return flow
+
+
 def rk4_flow_map_tspan(f, t0: float, t1: float, step_size: float = 0.01):
     """
     Build a flow map  Φ_{t0}^{t1}  for a **nonautonomous** ODE by composing

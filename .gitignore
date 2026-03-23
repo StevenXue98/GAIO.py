@@ -43,3 +43,7 @@ references/GAIO.jl-master/
 # ── Golden master (local only — regenerate with: julia golden_master/generate.jl) ──
 golden_master/
 tests/test_golden_master.py
+
+# ── Benchmark results (generated artifacts — regenerate with benchmark_*.py) ──
+# To pin a specific run: git add -f results/canonical_a100.json
+results/

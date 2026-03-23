@@ -54,11 +54,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import sys
 import time
 import warnings
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+
+_RESULTS_DIR = pathlib.Path(__file__).parent.parent / "results"
+
+
+def _json_path(name: str) -> pathlib.Path:
+    """Resolve a JSON filename to the results/ directory if no dir is given."""
+    p = pathlib.Path(name)
+    return _RESULTS_DIR / p if p.parent == pathlib.Path(".") else p
 
 import numpy as np
 
@@ -127,18 +136,20 @@ def _make_python_map(domain, unit_pts):
 def _make_cpu_map(domain, unit_pts):
     from numba import njit
     from gaio import rk4_flow_map, AcceleratedBoxMap
+    from gaio.maps.rk4 import make_njit_rk4_flow_map
 
     @njit
-    def _fw_jit(x):
+    def _fw_vfield(x):
         return np.array([
             A_FW * x[0] + x[1] * x[2],
             D_FW * x[1] + B_FW * x[0] - x[2] * x[1],
             -x[2] - x[0] * x[1],
         ])
 
+    f_jit = make_njit_rk4_flow_map(_fw_vfield, step_size=0.01, steps=20)
     f_cpu = rk4_flow_map(_four_wing_v, step_size=0.01, steps=20)
     return AcceleratedBoxMap(f_cpu, domain, unit_pts,
-                             f_jit=_fw_jit, backend="cpu")
+                             f_jit=f_jit, backend="cpu")
 
 
 def _make_gpu_map(domain, unit_pts):
@@ -282,8 +293,8 @@ def main(argv=None):
                         help="Subdivision steps (default: 8; keep small for fast Python baseline)")
     parser.add_argument("--grid-res", type=int, default=2,
                         help="Grid cells per dimension (default: 2 = 8 initial cells for 3-D)")
-    parser.add_argument("--test-pts", type=int, default=3,
-                        help="Test points per dimension (default: 3 = 27 pts/cell)")
+    parser.add_argument("--test-pts", type=int, default=4,
+                        help="Test points per dimension (default: 4 = 64 pts/cell, matches GAIO.jl GridBoxMap default)")
     parser.add_argument("--backends", nargs="+",
                         choices=["python", "cpu", "gpu"],
                         default=["python", "cpu", "gpu"],
@@ -355,9 +366,11 @@ def main(argv=None):
     print("*Map time = relative_attractor; T_op time = TransferOperator.*")
 
     if args.json:
-        with open(args.json, "w") as fh:
+        out = _json_path(args.json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w") as fh:
             json.dump([asdict(r) for r in results], fh, indent=2)
-        print(f"\nResults saved to {args.json}")
+        print(f"\nResults saved to {out}")
 
 
 if __name__ == "__main__":

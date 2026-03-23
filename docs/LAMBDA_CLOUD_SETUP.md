@@ -1,120 +1,108 @@
 # Lambda Cloud Deployment Guide: GAIO.py Multi-GPU
 
 Step-by-step instructions for deploying GAIO.py on a fresh Lambda Labs
-GPU instance and running the Phase 4/5 benchmarks.
+GPU instance and running the Phase 3/4/5 benchmarks.
 
 **Target instance:**
 `gpu_8x_a100` (8× A100 80 GB, NVLink) or `gpu_4x_a10` (4× A10 24 GB).
-Smaller instances like `gpu_1x_a10` work for single-GPU Phase 3 benchmarks
-only.  All steps assume Ubuntu 22.04 with CUDA 12.x pre-installed by Lambda.
+Smaller instances like `gpu_1x_a100` or `gpu_1x_a10` work for single-GPU
+Phase 3 benchmarks only.  All steps assume **Lambda Stack Ubuntu 22.04**
+with CUDA 12.x pre-installed by Lambda.
 
 ---
 
-## 1. What Lambda Provides Out of the Box
+## 1. What Lambda Stack 22.04 Provides Out of the Box
 
-Lambda instances ship with:
+Lambda Stack 22.04 instances ship with:
 
-- CUDA toolkit + driver (typically CUDA 12.2, driver ≥ 525)
+- CUDA toolkit + driver (CUDA 12.x, driver ≥ 525; observed 12.8 on A100 nodes)
 - `nvidia-smi` and `nvcc` on PATH
-- Miniconda (at `~/miniconda3`)
-- OpenMPI **without** CUDA support — must be recompiled (see §3)
+- CUDA-aware OpenMPI at `/usr/mpi/gcc/openmpi-4.1.7rc1/` — **no recompile needed**
+- **No conda** — must be installed manually (see §2)
 
-Verify the CUDA version before proceeding:
+Verify the CUDA version and OpenMPI CUDA support before proceeding:
 
 ```bash
 nvcc --version
 nvidia-smi
+ompi_info | grep -i cuda    # should show "MPI extensions: ..., cuda, ..."
 ```
+
+> **Note on `cudatoolkit` version:** `environment.yml` pins `cudatoolkit=11.8`
+> inside the conda env.  This is intentional and correct — CUDA drivers are
+> forward-compatible, so a 12.x system driver runs code built against an 11.x
+> runtime without changes.  Do not upgrade the pin; numba 0.59 is validated
+> against 11.8.
 
 ---
 
 ## 2. One-Shot Setup Script
 
 Copy, paste, and run the entire block below in a fresh SSH session.
-It takes approximately 15–20 minutes on a `gpu_4x_a10` instance.
+It takes approximately 5–10 minutes on a `gpu_1x_a100` instance
+(no OpenMPI compile needed on Lambda Stack 22.04).
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
 # ── 0. Variables ─────────────────────────────────────────────────────────────
-OMPI_VERSION="4.1.6"
-CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
-INSTALL_PREFIX="$HOME/opt/openmpi-${OMPI_VERSION}"
+# Lambda Stack 22.04 ships CUDA-aware OpenMPI here — no custom build required.
+SYSTEM_OMPI="/usr/mpi/gcc/openmpi-4.1.7rc1"
 GAIO_REPO="$HOME/GAIO.py"
 CONDA_ENV="gaio"
 
-# ── 1. System packages ────────────────────────────────────────────────────────
-sudo apt-get update -qq
-sudo apt-get install -y --no-install-recommends \
-    build-essential gfortran wget git \
-    libucx-dev libibverbs-dev          # UCX for GPUDirect RDMA
+# ── 1. Install Miniconda (not pre-installed on Lambda Stack 22.04) ────────────
+wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+    -O /tmp/miniconda.sh
+bash /tmp/miniconda.sh -b -p "$HOME/miniconda3"
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
 
-# ── 2. Download and compile CUDA-aware OpenMPI 4.1.x ─────────────────────────
-# Lambda's default OpenMPI lacks --with-cuda; this build enables
-# GPUDirect RDMA (device buffers passed directly to MPI without staging).
-cd /tmp
-wget -q "https://download.open-mpi.org/release/open-mpi/v4.1/openmpi-${OMPI_VERSION}.tar.bz2"
-tar -xf "openmpi-${OMPI_VERSION}.tar.bz2"
-cd "openmpi-${OMPI_VERSION}"
+# Persist conda initialisation for future SSH sessions
+"$HOME/miniconda3/bin/conda" init bash
+echo 'source "$HOME/miniconda3/etc/profile.d/conda.sh"' >> ~/.bashrc
 
-./configure \
-    --prefix="${INSTALL_PREFIX}" \
-    --with-cuda="${CUDA_HOME}" \
-    --with-ucx=/usr \
-    --enable-mpirun-prefix-by-default \
-    --disable-static \
-    2>&1 | tail -5   # show only the final summary lines
-
-make -j"$(nproc)" install 2>&1 | tail -3
-
-# ── 3. Persistent environment variables ───────────────────────────────────────
+# ── 2. Persistent environment variables for system OpenMPI ────────────────────
 cat >> ~/.bashrc << EOF
 
-# GAIO.py: CUDA-aware OpenMPI ${OMPI_VERSION}
-export PATH="${INSTALL_PREFIX}/bin:\$PATH"
-export LD_LIBRARY_PATH="${INSTALL_PREFIX}/lib:\${LD_LIBRARY_PATH:-}"
+# GAIO.py: Lambda Stack CUDA-aware OpenMPI
+export PATH="${SYSTEM_OMPI}/bin:\$PATH"
+export LD_LIBRARY_PATH="${SYSTEM_OMPI}/lib:\${LD_LIBRARY_PATH:-}"
 export OMPI_MCA_opal_cuda_support=1      # enable GPUDirect at runtime
 export UCX_TLS=rc,cuda_copy,cuda_ipc     # UCX transport: IB + CUDA peer
 EOF
 
-export PATH="${INSTALL_PREFIX}/bin:$PATH"
-export LD_LIBRARY_PATH="${INSTALL_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+export PATH="${SYSTEM_OMPI}/bin:$PATH"
+export LD_LIBRARY_PATH="${SYSTEM_OMPI}/lib:${LD_LIBRARY_PATH:-}"
 export OMPI_MCA_opal_cuda_support=1
 export UCX_TLS=rc,cuda_copy,cuda_ipc
 
-# Verify the build includes CUDA support
-mpirun --version
-ompi_info | grep -i "cuda\|Built on"
+# Verify CUDA-aware MPI is active
+ompi_info | grep -i "cuda\|MPI extensions"
 
-# ── 4. Conda environment ──────────────────────────────────────────────────────
-source ~/miniconda3/etc/profile.d/conda.sh
-
-conda create -y -n "${CONDA_ENV}" python=3.11 \
-    -c conda-forge -c nvidia -c defaults \
-    numpy scipy numba cudatoolkit=12.2 \
-    matplotlib tqdm jupyter ipykernel \
-    pytest pytest-cov line_profiler memory_profiler
-
+# ── 3. Conda environment from environment.yml ─────────────────────────────────
+# cudatoolkit=11.8 in environment.yml is backward-compatible with CUDA 12.x
+# system drivers — do not change the pin.
+cd "${GAIO_REPO}"
+conda env create -f environment.yml
 conda activate "${CONDA_ENV}"
 
-# ── 5. mpi4py — must be compiled against our custom OpenMPI, NOT conda's ─────
-# Point the compiler wrappers at the CUDA-aware build from step 2.
-MPICC="${INSTALL_PREFIX}/bin/mpicc" \
+# ── 4. mpi4py — compile against the system CUDA-aware OpenMPI ────────────────
+# Must use --no-binary so mpi4py links to the correct libmpi.so, not conda's.
+MPICC="${SYSTEM_OMPI}/bin/mpicc" \
     pip install --no-binary mpi4py mpi4py
 
-# ── 6. PETSc / SLEPc — distributed eigensolve (Phase 4 eigendecomposition) ──
-# petsc4py / slepc4py from conda-forge link against their own PETSc build
-# with MPI support.  They do NOT need to link against our custom OpenMPI
-# because they only use MPI for Krylov basis distribution (CPU RAM),
-# not for GPU-VRAM Allgatherv.  The conda-forge builds are correct here.
+# ── 5. PETSc / SLEPc — distributed eigensolve (Phase 4, optional) ────────────
+# conda-forge builds link against their own PETSc/MPI; they do NOT need to
+# link to the system OpenMPI because they only use MPI for CPU-side Krylov
+# basis work, not GPU-VRAM transfers.  Install is optional — Phase 4 falls
+# back to scipy ARPACK automatically if slepc4py is absent.
 conda install -y -c conda-forge petsc4py slepc4py
 
-# ── 7. Install GAIO.py ────────────────────────────────────────────────────────
-cd "${GAIO_REPO}"
+# ── 6. Install GAIO.py ────────────────────────────────────────────────────────
 pip install -e ".[gpu,mpi,hpc,dev]"
 
-# ── 8. One-rank smoke test ────────────────────────────────────────────────────
+# ── 7. One-rank smoke test ────────────────────────────────────────────────────
 python -c "
 from gaio import Box, BoxPartition, BoxSet, TransferOperator, relative_attractor
 from gaio.mpi import check_cuda_aware_mpi
@@ -212,11 +200,15 @@ EOF
 ### Phase 3 — single-GPU acceleration (baseline, no mpirun needed)
 
 ```bash
-# ~30 s; shows Python → Numba → CUDA speedup
+# ~2 min; shows Python → Numba JIT → CUDA speedup across all three backends.
+# Verified on A100 SXM4 40 GB: cpu=112×, gpu=174× vs. pure-Python baseline.
 python benchmarks/benchmark_phase3.py --steps 10 --grid-res 2
 ```
 
 ### Phase 4 — multi-GPU MPI scaling (1-GPU vs N-GPU)
+
+Requires a multi-GPU instance (`gpu_4x_a10`, `gpu_4x_a100`, etc.).
+On a single-GPU instance, run with `-n 1` to confirm correctness only.
 
 ```bash
 # Bind one rank per GPU; large enough problem for meaningful GPU utilisation
@@ -252,7 +244,7 @@ mpirun -n 4 --bind-to socket \
 
 | Benchmark goal | Recommended instance | Notes |
 |---|---|---|
-| Phase 3 single-GPU | `gpu_1x_a10` | Cheapest; Python/Numba/CUDA comparison |
+| Phase 3 single-GPU | `gpu_1x_a10` or `gpu_1x_a100` | Cheapest; Python/Numba/CUDA comparison |
 | Phase 4 scaling | `gpu_4x_a10` or `gpu_4x_a100` | Need ≥4 GPUs on same NVLink fabric |
 | Phase 5 max imbalance | `gpu_4x_a100` | Larger A100 VRAM fits deeper subdivision |
 | Full suite | `gpu_8x_a100` | Reserve for publication-quality numbers |
@@ -267,10 +259,12 @@ statistical significance.
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `conda: command not found` | Miniconda not installed or not sourced | Run `source ~/.bashrc` or re-login; if miniconda not installed, run §2 step 1 |
 | `PMPI_Init_thread: Unknown error class` | OFI fabric mismatch on Lambda | `export UCX_TLS=tcp,cuda_copy` (disables IB, slower but safe) |
 | `mpirun: command not found` | PATH not updated | `source ~/.bashrc` or re-login |
-| `ImportError: libmpi.so` | mpi4py linked to wrong libmpi | Reinstall: `MPICC=.../mpicc pip install --no-binary mpi4py mpi4py` |
+| `ImportError: libmpi.so` | mpi4py linked to wrong libmpi | Reinstall: `MPICC=/usr/mpi/gcc/openmpi-4.1.7rc1/bin/mpicc pip install --no-binary mpi4py mpi4py` |
 | `NumbaPerformanceWarning: Grid size 2` | Problem too small for GPU | Use `--steps 14 --grid-res 4 --test-pts 5`; warnings already suppressed in benchmarks |
 | RDMA probe returns `NO` | Lambda's network stack lacks UCX IB | Normal on A10 nodes; GPU-to-GPU via `cuda_ipc` still available; set `UCX_TLS=cuda_copy,cuda_ipc` |
 | `slepc4py` not found | SLEPc optional dependency absent | `conda install -c conda-forge petsc4py slepc4py`; fallback to scipy ARPACK is automatic |
 | Rank segfaults at MPI_Init | CUDA context not created before MPI calls | Call `cuda.select_device(rank())` before any GAIO computation |
+| `ompi_info` shows no `cuda` in MPI extensions | Wrong mpirun on PATH | Confirm `which mpirun` points to `/usr/mpi/gcc/openmpi-4.1.7rc1/bin/mpirun` |

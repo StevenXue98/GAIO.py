@@ -466,21 +466,81 @@ through a `_SerialComm` stub that returns input arrays unchanged with no
 copies and no mpi4py import.  The entire MPI machinery adds zero overhead
 to single-GPU usage.
 
-### Benchmark results (3-D Four-Wing, 14 subdivision steps)
+### Benchmark results — Phase 3 (3-D Four-Wing, 10 subdivision steps)
 
-> Run with `python benchmarks/benchmark_phase3.py` (single GPU) or
-> `mpiexec -n 4 python benchmarks/benchmark_phase4.py --steps 16 --grid-res 4` (4 GPUs).
-> Column "GAIO.jl" is the Julia reference on the same hardware for comparison.
+> Run with `python benchmarks/benchmark_phase3.py --steps 10 --grid-res 2` (single GPU).
+> Hardware: NVIDIA A100 SXM4 40 GB, 30-core CPU (Lambda Cloud `gpu_1x_a100`).
+> Test points: 4³ = 64 per cell (matches GAIO.jl `GridBoxMap` default).
+> Python/CPU/GPU: 4,046 cells, nnz=15,240. GAIO.jl: 4,687 cells, nnz=27,391 (different
+> test-point placement — Julia's GridBoxMap places points at cell-face midpoints vs. Python's
+> interior linspace; both are valid outer approximations).
+> GAIO.jl timed after JIT warm-up (steps=10, `BoxMap(:grid, f, P)`, Julia 1.12.5).
 
-| Backend      | Attractor cells | Map (s) | T_op (s) | Total (s) | Speedup | GAIO.jl (s) |
-|--------------|-----------------|---------|----------|-----------|---------|-------------|
-| python       |           ~8 K  |    —    |    —     |     —     |   1×    |      —      |
-| cpu (Numba)  |           ~8 K  |    —    |    —     |     —     |   —     |      —      |
-| gpu (1× GPU) |           ~8 K  |    —    |    —     |     —     |   —     |      —      |
-| mpi-gpu (4×) |           ~8 K  |    —    |    —     |     —     |   —     |      —      |
+| Backend        | Attractor cells | Map (s) | T_op (s) | Total (s) | Speedup | GAIO.jl (s) |
+|----------------|-----------------|---------|----------|-----------|---------|-------------|
+| python         |           4,046 |  200.98 |    80.70 |    281.68 |    1.0× |           — |
+| cpu (Numba)    |           4,046 |    1.63 |     0.20 |      1.83 |  154.0× |        1.78 |
+| gpu (A100)     |           4,046 |    0.63 |     0.11 |      0.74 |  381.8× |        0.61 |
+| mpi-gpu (4×)   |             —   |     —   |      —   |       —   |     —   |         N/A |
 
-*Table cells marked `—` are placeholders; run the benchmark on your hardware
-and submit a PR with your results.*
+*`mpi-gpu` row requires a multi-GPU instance; run*
+*`mpiexec -n 4 python benchmarks/benchmark_phase4.py --steps 16 --grid-res 4` and fill in.*
+*GAIO.jl does not support multi-GPU, so that cell is N/A.*
+*GAIO.jl CPU: map=0.985 s + T\_op=0.798 s = 1.78 s (4,687 cells, nnz=27,391).*
+*GAIO.jl GPU: map=0.058 s (GPU) + T\_op=0.554 s (CPU fallback†) = 0.61 s.*
+*†GAIO.jl's `construct_transfers` GPU path has a bug (codomain rebound to empty set → nnz=0);*
+*T\_op falls back to the CPU BoxMap. GPU accelerates only `relative_attractor` (17× vs CPU map).*
+
+---
+
+### Benchmark results — Phase 4 (multi-GPU MPI scaling, Four-Wing)
+
+> **Single run fills this table:** `mpiexec -n 4 --bind-to socket python benchmarks/benchmark_phase4.py`
+> (default: `--steps 16 --grid-res 4 --test-pts 4`, ~60–90 s serial baseline on A100).
+> For the 8-GPU row, run separately with `mpiexec -n 8`.
+> Hardware: NVIDIA A100 SXM4 40 GB (Lambda Cloud `gpu_4x_a100`).
+> Four-Wing attractor — near-uniform (~1.1× COO imbalance), so speedup reflects
+> genuine MPI parallelism, not load-balancing effects.
+
+| Config        | Attractor cells | Attractor (s) | T_op (s) | Total (s) | Speedup |
+|---------------|-----------------|---------------|----------|-----------|---------|
+| 1 GPU serial  |             —   |             — |        — |         — |    1.0× |
+| 4 GPU (MPI)   |             —   |             — |        — |         — |      —  |
+| 8 GPU (MPI)   |             —   |             — |        — |         — |      —  |
+
+*Fill in on a multi-GPU instance. The benchmark prints README-ready table rows at the end of each run.*
+
+---
+
+### Benchmark results — Phase 5 (load balancing, static Morton vs adaptive)
+
+Phase 5 replaces the uniform K/P Morton split with a weighted split proportional to
+per-cell hit density, reducing COO imbalance and T_op wall time on non-uniform attractors.
+
+The Lozi map (a=1.7, b=0.5) has a thin angular filament concentrated in one corner of its
+domain. Inflating the bounding box puts cold fringe cells on certain Morton slabs, creating
+a genuine hot/cold COO split. Two scenarios expose different severity levels:
+
+> **Single run fills both tables:** `mpiexec -n 4 python benchmarks/benchmark_phase5.py`
+> (default: runs `moderate` then `extreme` scenarios; prints README-ready rows at the end).
+
+**Scenario 1 — Moderate imbalance (~4-5×):** Lozi, steps=16, domain\_scale=9.0
+
+| Decomposition         | Cells | T_op (s) | Imbalance | Notes |
+|-----------------------|-------|----------|-----------|-------|
+| Phase 4 static Morton |     — |        — |      ~4.5× | cold rank 0 gets ~10% of COO entries |
+| Phase 5 weighted      |     — |        — |      ~1.0× | fill in after running |
+
+**Scenario 2 — Extreme imbalance (~30×):** Lozi, steps=16, domain\_scale=12.0
+
+| Decomposition         | Cells | T_op (s) | Imbalance | Notes |
+|-----------------------|-------|----------|-----------|-------|
+| Phase 4 static Morton |     — |        — |      ~30× | rank 0 gets only ~1% of COO entries |
+| Phase 5 weighted      |     — |        — |      ~1.0× | fill in after running |
+
+*Fill in Cells and T\_op timings after running `benchmark_phase5.py` on a `gpu_4x_a100` instance.*
+*Imbalance arises because Lozi's thin attractor occupies only a fraction of the inflated domain;*
+*Morton Z-order clusters cold fringe cells (few hits) on one rank while others get core cells.*
 
 ---
 

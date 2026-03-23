@@ -2,112 +2,128 @@
 benchmarks/benchmark_imbalance.py
 ==================================
 Demonstrates load imbalance under Phase 4's static Morton decomposition
-for three chaotic systems with very different attractor geometries.
+for chaotic systems with different attractor geometries.
 
 Maps
 ----
-    henon     — Hénon map (2-D discrete, thin Cantor-set filaments)
-    ikeda     — Ikeda map (2-D discrete, dense off-center spiral cluster)
-    fourwing  — Four-Wing system (3-D ODE, spatially spread, near-balanced)
+    henon     — Hénon map (2-D discrete, fractal horseshoe)
+    ikeda     — Ikeda map (2-D discrete, off-centre spiral cluster)
+    lozi      — Lozi map  (2-D discrete, thin angular filament — extreme imbalance)
+    fourwing  — Four-Wing system (3-D ODE, spatially spread, near-uniform)
+                WARNING: fourwing convergence takes several hours; excluded by default.
 
-The attractor geometry of Hénon and Ikeda concentrates cells in a small
-fraction of the domain bounding box.  Static Morton decomposition gives
-each rank a spatially compact slab, but that slab may contain very
-different numbers of attractor cells.  The imbalance ratio (max/min
-per-rank COO entries) quantifies how much work one rank must do while
-others wait at the Allgatherv barrier.
+Why imbalance occurs
+--------------------
+Morton decomposition divides attractor cells into P spatially compact
+slabs (one per rank).  COO entries — the per-rank work — equal the number
+of test-point hits recorded by each cell.  Imbalance arises when cells
+assigned to different ranks have very different hit rates:
 
-This benchmark serves two purposes:
+  * **Fringe cells** (near domain boundary or attractor boundary) have
+    test points that frequently escape the codomain → few hits → "cold".
+  * **Core cells** (deep inside the attractor) have nearly all test
+    points hitting valid cells → many hits → "hot".
 
-1.  Motivate Phase 5 (dynamic load balancing) by showing cases where
-    static Morton decomposition produces severe imbalance (Hénon ≫ 10×,
-    Ikeda 3–8×).
+With a fully-converged attractor and a tight domain
+(``--domain-scale 1.0``), core and fringe cells mix uniformly in Morton
+order — imbalance stays at 1.1–1.3× for all maps.
 
-2.  Provide a regression baseline: after Phase 5 is implemented, running
-    with ``--phase5`` should show imbalance ratios approaching 1.0 for
-    all three maps.
+To expose genuine imbalance, inflate the domain with ``--domain-scale``
+so that the attractor occupies only a fraction of the covering.  The
+"empty" region adds many cold fringe cells.  Morton order will cluster
+these cold cells on a few ranks, creating a hot/cold split.
+
+The two predefined scenarios in ``benchmark_phase5.py`` use exactly this
+mechanism with the Lozi map, and this script uses the same full-width
+test points (``linspace(-1.0, 1.0)``) so the imbalance numbers match:
+
+  * **Moderate** (``benchmark_phase5.py --scenario moderate``):
+    domain_scale=9.0, steps=16 → ~4–5× imbalance across 4 ranks.
+
+  * **Extreme** (``benchmark_phase5.py --scenario extreme``):
+    domain_scale=12.0, steps=16 → ~30× imbalance across 4 ranks.
+    Rank 0 receives only ~1% of COO entries while rank 3 handles ~40%.
+
+Use this script to inspect the raw per-rank COO distribution; use
+``benchmark_phase5.py`` to measure the Phase 4 → Phase 5 speedup.
+
+Key flags
+---------
+  --domain-scale S    Inflate domain radius by S (default: 1.0).
+                      Use 9.0 for moderate (~4–5×) or 12.0 for extreme
+                      (~30×) Lozi imbalance, matching the phase5 scenarios.
+  --attractor-steps N Use only N subdivision steps for relative_attractor
+                      (default: same as --steps).  Fewer steps → coarser,
+                      partially converged attractor → more fringe cells.
+  --maps M [M ...]    Maps to benchmark.  Default: henon ikeda lozi.
+                      Add fourwing explicitly if needed (slow).
 
 Usage
 -----
-    # 2-rank MPI (CPU, no GPU needed)
-    mpiexec -n 2 python benchmarks/benchmark_imbalance.py
-
-    # 4-rank MPI
+    # Default run (henon + ikeda + lozi, domain_scale=1.0 → low imbalance)
     mpiexec -n 4 python benchmarks/benchmark_imbalance.py
 
-    # Select specific maps
-    mpiexec -n 4 python benchmarks/benchmark_imbalance.py --maps henon ikeda
+    # Reproduce phase5 moderate scenario (Lozi, ~4-5× imbalance)
+    mpiexec -n 4 python benchmarks/benchmark_imbalance.py \\
+        --maps lozi --steps 16 --domain-scale 9.0
 
-    # Adjust subdivision depth (more steps → more concentrated attractor)
-    mpiexec -n 4 python benchmarks/benchmark_imbalance.py --steps 14
+    # Reproduce phase5 extreme scenario (Lozi, ~30× imbalance)
+    mpiexec -n 4 python benchmarks/benchmark_imbalance.py \\
+        --maps lozi --steps 16 --domain-scale 12.0
 
-    # Save summary to JSON
-    mpiexec -n 4 python benchmarks/benchmark_imbalance.py --json imbalance.json
+    # Save results to JSON (written to results/ directory)
+    mpiexec -n 4 python benchmarks/benchmark_imbalance.py --json out.json
 
-    # Serial single-process (shows degenerate 1-rank table as sanity check)
+    # Serial single-process (1-rank degenerate table, sanity check)
     python benchmarks/benchmark_imbalance.py
 
-Expected output (4 ranks, --steps 12)
---------------------------------------
-    ══════════════════════════════════════════════════════════
-     Hénon Map  (a=1.4, b=0.3) — 4 ranks, steps=12
-    ══════════════════════════════════════════════════════════
-      Per-rank COO contribution (Phase 4, static Morton)
-        Rank    COO entries    % of total
-      ----------------------------------------
-           0            318          1.6%
-           1          4,102         20.4%
-           2         12,867         64.0%
-           3          2,829         14.1%
-      ----------------------------------------
-       Total         20,116        100.0%
-      Load imbalance (max/min): 40.5×  ← HIGH — Phase 5 target
+Expected output (4 ranks, --steps 12, --domain-scale 1.0, default)
+--------------------------------------------------------------------
+Morton Z-order distributes attractor cells uniformly — imbalance ≈ 1.1×
+for all maps with a tight domain (A100 Lambda instance):
 
-    ══════════════════════════════════════════════════════════
-     Ikeda Map  (μ=0.9) — 4 ranks, steps=12
-    ══════════════════════════════════════════════════════════
-      Per-rank COO contribution (Phase 4, static Morton)
-        Rank    COO entries    % of total
-      ----------------------------------------
-           0          2,811         14.0%
-           1          9,216         45.9%
-           2          6,102         30.4%
-           3          1,953          9.7%
-      ----------------------------------------
-       Total         20,082        100.0%
-      Load imbalance (max/min): 4.7×   ← MODERATE — Phase 5 beneficial
-
-    ══════════════════════════════════════════════════════════
-     Four-Wing System — 4 ranks, steps=12
-    ══════════════════════════════════════════════════════════
-      Per-rank COO contribution (Phase 4, static Morton)
-        Rank    COO entries    % of total
-      ----------------------------------------
-           0          5,234         24.8%
-           1          5,089         24.1%
-           2          5,411         25.7%
-           3          5,361         25.4%
-      ----------------------------------------
-       Total         21,095        100.0%
-      Load imbalance (max/min): 1.06×  ← LOW — Phase 4 adequate
-
-    ──────────────────────────────────────────────────────────
     Summary (Phase 4 static Morton, 4 ranks, steps=12)
     ──────────────────────────────────────────────────────────
-    Map            Cells     Imbalance    Idle fraction    Assessment
-    henon         20,116       40.5×          97.5%        Phase 5 target
-    ikeda         20,092        4.9×          79.6%        Phase 5 beneficial
-    fourwing      21,095        1.1×           3.9%        Phase 4 adequate
+    Map                Cells   Imbalance    Idle %  Assessment
+    ──────────────────────────────────────────────────────────
+    henon                779        1.2×      5.2%  Phase 4 adequate
+    ikeda              3,597        1.1×      5.5%  Phase 4 adequate
+    lozi               1,367        1.1×      2.4%  Phase 4 adequate
+
+Expected output (4 ranks, Lozi, --steps 16, --domain-scale 12.0)  ← phase5 extreme
+------------------------------------------------------------------------------------
+Large inflated domain concentrates Lozi attractor in one corner →
+cold fringe cells dominate rank 0's shard (~30× imbalance):
+
+    ══════════════════════════════════════════════════════════
+     Lozi Map   (a=1.7, b=0.5) — 4 ranks, steps=16
+    ══════════════════════════════════════════════════════════
+      Per-rank COO contribution (Phase 4, static Morton)
+          Rank     COO entries    % of total
+      ----------------------------------------
+             0             (very few)   ~1%
+             1–3            (many)      ~99%  (split ~30–40% each)
+      ----------------------------------------
+      Load imbalance (max/min): ~30×   ← Phase 5 essential
 """
 from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import sys
 import time
 import warnings
 from dataclasses import dataclass, asdict
 from typing import Optional
+
+_RESULTS_DIR = pathlib.Path(__file__).parent.parent / "results"
+
+
+def _json_path(name: str) -> pathlib.Path:
+    """Resolve a JSON filename to the results/ directory if no dir is given."""
+    p = pathlib.Path(name)
+    return _RESULTS_DIR / p if p.parent == pathlib.Path(".") else p
 
 import numpy as np
 
@@ -151,6 +167,14 @@ def _four_wing_v(x: np.ndarray) -> np.ndarray:
     ])
 
 
+_LOZI_A, _LOZI_B = 1.7, 0.5
+
+
+def _lozi_map(x: np.ndarray) -> np.ndarray:
+    """Lozi map: x' = 1 - a·|x₀| + x₁,  y' = b·x₀   (a=1.7, b=0.5)."""
+    return np.array([1.0 - _LOZI_A * abs(x[0]) + x[1], _LOZI_B * x[0]])
+
+
 # Map registry: name → (callable, domain_center, domain_radius, label, ndim)
 # domain: Box(center - radius, center + radius)
 _MAP_REGISTRY = {
@@ -167,6 +191,14 @@ _MAP_REGISTRY = {
         np.array([1.0, 0.0]),
         np.array([1.5, 1.5]),
         "Ikeda Map  (μ=0.9)",
+        2,
+        "discrete",
+    ),
+    "lozi": (
+        _lozi_map,
+        np.array([0.0, 0.0]),
+        np.array([1.5, 0.75]),
+        "Lozi Map   (a=1.7, b=0.5)",
         2,
         "discrete",
     ),
@@ -256,6 +288,8 @@ def _run_map(
     steps: int,
     comm,
     test_pts_per_dim: int = 3,
+    domain_scale: float = 1.0,
+    attractor_steps: int | None = None,
 ) -> ImbalanceResult:
     from gaio import Box, BoxPartition, BoxSet, relative_attractor, TransferOperator
 
@@ -264,12 +298,13 @@ def _run_map(
     n_ranks = comm.Get_size()
     my_rank = comm.Get_rank()
 
-    # Domain and initial partition (coarse: 2^ndim cells)
-    domain = Box(center, radius)
+    # domain_scale > 1 inflates the bounding box, retaining fringe cells with
+    # low hit rates alongside core attractor cells — increases COO imbalance.
+    domain = Box(center, radius * domain_scale)
     P = BoxPartition(domain, [2] * ndim)
 
     # Test points: uniform grid over unit cube
-    t = np.linspace(-0.5, 0.5, test_pts_per_dim)
+    t = np.linspace(-1.0, 1.0, test_pts_per_dim)
     grids = np.meshgrid(*([t] * ndim), indexing="ij")
     unit_pts = np.stack([g.ravel() for g in grids], axis=1)
 
@@ -282,10 +317,13 @@ def _run_map(
     S = BoxSet.full(P)
 
     # ── Phase A: distributed attractor ───────────────────────────────────────
+    # attractor_steps < steps → partially converged; retains fringe cells with
+    # low test-point hit rates, producing a genuine hot/cold COO split.
+    _asteps = attractor_steps if attractor_steps is not None else steps
     comm.Barrier()
     t0 = time.perf_counter()
     try:
-        A = relative_attractor(F, S, steps=steps, comm=comm)
+        A = relative_attractor(F, S, steps=_asteps, comm=comm)
     except Exception as exc:
         return ImbalanceResult(map_name, label, n_ranks, steps,
                                0, 0, [], 0.0, 0.0,
@@ -423,12 +461,34 @@ def main(argv=None):
     parser.add_argument(
         "--maps", nargs="+",
         choices=list(_MAP_REGISTRY.keys()),
-        default=list(_MAP_REGISTRY.keys()),
-        help="Maps to benchmark (default: all three)",
+        default=["henon", "ikeda", "lozi"],
+        help="Maps to benchmark (default: henon, ikeda, lozi; fourwing excluded by default — it takes several hours to converge)",
     )
     parser.add_argument(
         "--steps", type=int, default=12,
-        help="Subdivision steps (default: 12; more steps → more concentrated attractor)",
+        help=(
+            "Subdivision steps (default: 12 for laptop/WSL; "
+            "use 16 on a cloud GPU instance such as Lambda gpu_4x_a100 "
+            "for higher imbalance ratios and more meaningful Phase 5 comparisons; "
+            "WARNING: steps >= 16 with Hénon/Ikeda/Lozi will OOM or time out on a laptop)"
+        ),
+    )
+    parser.add_argument(
+        "--attractor-steps", type=int, default=None,
+        help=(
+            "Subdivision steps for relative_attractor (default: same as --steps). "
+            "Use fewer steps than --steps to retain fringe cells with low hit rates, "
+            "producing extreme COO imbalance (e.g. --steps 14 --attractor-steps 10)."
+        ),
+    )
+    parser.add_argument(
+        "--domain-scale", type=float, default=1.0,
+        help=(
+            "Inflate domain radius by this factor (default: 1.0 = exact bounding box). "
+            "Values > 1 include empty fringe cells outside the attractor footprint, "
+            "which have very few COO hits — dramatically increases imbalance for "
+            "spatially concentrated maps like Lozi (try --domain-scale 2.0)."
+        ),
     )
     parser.add_argument(
         "--test-pts", type=int, default=3,
@@ -447,9 +507,13 @@ def main(argv=None):
 
     if my_rank == 0:
         print("\nGAIO.py Load-Imbalance Benchmark")
-        print(f"  Maps   : {', '.join(args.maps)}")
-        print(f"  Steps  : {args.steps}")
-        print(f"  Ranks  : {comm.Get_size()}")
+        print(f"  Maps        : {', '.join(args.maps)}")
+        print(f"  Steps       : {args.steps}")
+        _asteps = args.attractor_steps or args.steps
+        print(f"  Att. steps  : {_asteps}"
+              + ("  (partial — retains fringe cells)" if _asteps < args.steps else ""))
+        print(f"  Domain scale: {args.domain_scale:.1f}×")
+        print(f"  Ranks       : {comm.Get_size()}")
         print(f"  Test pts/dim: {args.test_pts}")
 
     results: list[ImbalanceResult] = []
@@ -460,7 +524,9 @@ def main(argv=None):
             print(f"\n  Running {label} …", end="", flush=True)
 
         result = _run_map(map_name, steps=args.steps, comm=comm,
-                          test_pts_per_dim=args.test_pts)
+                          test_pts_per_dim=args.test_pts,
+                          domain_scale=args.domain_scale,
+                          attractor_steps=args.attractor_steps)
         results.append(result)
 
         if my_rank == 0:
@@ -478,9 +544,18 @@ def main(argv=None):
         _print_summary_table(results)
 
         if args.json:
-            with open(args.json, "w") as fh:
-                json.dump([asdict(r) for r in results], fh, indent=2)
-            print(f"\nResults saved to {args.json}")
+            class _NpEncoder(json.JSONEncoder):
+                def default(self, obj):
+                    if isinstance(obj, np.integer):
+                        return int(obj)
+                    if isinstance(obj, np.floating):
+                        return float(obj)
+                    return super().default(obj)
+            out_path = _json_path(args.json)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, "w") as fh:
+                json.dump([asdict(r) for r in results], fh, indent=2, cls=_NpEncoder)
+            print(f"\nResults saved to {out_path}")
 
 
 if __name__ == "__main__":
