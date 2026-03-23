@@ -160,17 +160,19 @@ class BenchResult:
 def _make_numba_map(domain, unit_pts):
     from numba import njit
     from gaio import rk4_flow_map, AcceleratedBoxMap
-    from gaio.maps.rk4 import make_njit_rk4_flow_map
+    from gaio.maps.rk4 import make_njit_rk4_flow_map_scalar3
 
+    # Scalar vfield: takes 3 floats, returns 3-tuple — zero heap allocation
+    # inside the RK4 loop.  All stage vectors live in CPU registers.
     @njit(fastmath=True)
-    def _fw_vfield(x):
-        return np.array([
-            A_FW * x[0] + x[1] * x[2],
-            D_FW * x[1] + B_FW * x[0] - x[2] * x[1],
-            -x[2] - x[0] * x[1],
-        ])
+    def _fw_vfield_s(x0, x1, x2):
+        return (
+            A_FW * x0 + x1 * x2,
+            D_FW * x1 + B_FW * x0 - x2 * x1,
+            -x2 - x0 * x1,
+        )
 
-    f_jit = make_njit_rk4_flow_map(_fw_vfield, step_size=0.01, steps=20)
+    f_jit = make_njit_rk4_flow_map_scalar3(_fw_vfield_s, step_size=0.01, steps=20)
     f_cpu = rk4_flow_map(_four_wing_v, step_size=0.01, steps=20)
     return AcceleratedBoxMap(f_cpu, domain, unit_pts, f_jit=f_jit, backend="cpu")
 
@@ -522,31 +524,43 @@ def main(argv=None):
                     if r.impl.startswith("julia-") and "cuda" not in r.impl and r.ok), None)
     jl_gpu  = next((r for r in results if r.impl == "julia-cuda" and r.ok), None)
 
+    def _vs(a_time: float, b_time: float, a_label: str, b_label: str) -> tuple[str, str]:
+        """Return (multiplier_str, verdict) — always expressed as 'a is Nx faster/slower than b'."""
+        if b_time <= 0:
+            return "—", "?"
+        ratio = b_time / a_time   # > 1 means a is faster
+        if ratio > 1.05:
+            return f"{ratio:.2f}×", "faster than"
+        elif ratio < 0.95:
+            return f"{1.0 / ratio:.2f}×", "slower than"
+        else:
+            return f"{ratio:.2f}×", "on par with"
+
     if py_cpu and jl_cpu:
-        ratio = py_cpu.total_time / jl_cpu.total_time
-        verdict = ("faster" if ratio > 1.05 else "slower" if ratio < 0.95 else "on par with")
-        print(f"  CPU: numba is {ratio:.2f}× {verdict} {jl_cpu.impl}")
+        mul, verdict = _vs(py_cpu.total_time, jl_cpu.total_time, "numba", jl_cpu.impl)
+        map_mul, map_v = _vs(py_cpu.map_time, jl_cpu.map_time, "numba", jl_cpu.impl)
+        top_mul, top_v = _vs(py_cpu.t_op_time, jl_cpu.t_op_time, "numba", jl_cpu.impl)
+        print(f"  CPU: numba is {mul} {verdict} {jl_cpu.impl}")
         print(f"       map  : numba={py_cpu.map_time:.3f}s  {jl_cpu.impl}={jl_cpu.map_time:.3f}s  "
-              f"ratio={py_cpu.map_time / jl_cpu.map_time:.2f}×")
+              f"({map_mul} {map_v})")
         print(f"       T_op : numba={py_cpu.t_op_time:.3f}s  {jl_cpu.impl}={jl_cpu.t_op_time:.3f}s  "
-              f"ratio={py_cpu.t_op_time / jl_cpu.t_op_time:.2f}×")
+              f"({top_mul} {top_v})")
         print()
 
     if py_gpu and jl_gpu and jl_gpu.nnz > 0:
-        ratio = py_gpu.total_time / jl_gpu.total_time
-        verdict = ("faster" if ratio > 1.05 else "slower" if ratio < 0.95 else "on par with")
-        print(f"  GPU: numba-cuda is {ratio:.2f}× {verdict} julia-cuda")
+        mul, verdict = _vs(py_gpu.total_time, jl_gpu.total_time, "numba-cuda", "julia-cuda")
+        map_mul, map_v = _vs(py_gpu.map_time, jl_gpu.map_time, "numba-cuda", "julia-cuda")
+        print(f"  GPU: numba-cuda is {mul} {verdict} julia-cuda")
         print(f"       map  : numba-cuda={py_gpu.map_time:.3f}s  julia-cuda={jl_gpu.map_time:.3f}s  "
-              f"ratio={py_gpu.map_time / jl_gpu.map_time:.2f}×")
+              f"({map_mul} {map_v})")
         print(f"       (note: julia-cuda T_op uses float32; numba-cuda uses float64)")
         print()
     elif jl_gpu and jl_gpu.nnz == 0:
         print(f"  GPU: julia-cuda T_op returned nnz=0 (known GAIO.jl bug) — "
               f"GPU comparison limited to attractor map time only")
         if py_gpu:
-            ratio = py_gpu.map_time / jl_gpu.map_time
-            verdict = ("faster" if ratio > 1.05 else "slower" if ratio < 0.95 else "on par with")
-            print(f"       map-only: numba-cuda is {ratio:.2f}× {verdict} julia-cuda")
+            map_mul, map_v = _vs(py_gpu.map_time, jl_gpu.map_time, "numba-cuda", "julia-cuda")
+            print(f"       map-only: numba-cuda is {map_mul} {map_v} julia-cuda")
         print()
 
     # ── JSON export ───────────────────────────────────────────────────────────

@@ -149,23 +149,72 @@ julia --project=references/GAIO.jl-master -e 'using Pkg; Pkg.instantiate()'
 # Takes ~2–5 min on first run; subsequent runs are instant.
 ```
 
-### 3c. Install benchmark-specific Julia deps (SIMD + CUDA)
+### 3c. Create the benchmark environment (required for SIMD)
 
-`benchmark_vs_julia.py --setup-julia` adds `SIMD.jl` (fastest CPU backend,
-~2× over FLoops) and `CUDA.jl` (GPU backend) to the GAIO.jl project:
+> **Why a separate environment?**  `SIMD.jl` and `HostCPUFeatures.jl` are
+> declared as extension triggers in `references/GAIO.jl-master/Project.toml`
+> (`SIMDExt = ["SIMD", "HostCPUFeatures"]`).  Julia's extension system requires
+> triggers to be loaded *after* the parent package finishes initialising.
+> Running scripts with `--project=references/GAIO.jl-master` makes GAIO load
+> SIMD during its own init, creating a circular dependency that silently
+> prevents SIMDExt from loading.
+>
+> The fix: a **thin wrapper environment** that depends on both GAIO *and* SIMD.
+> Julia loads GAIO first (no SIMD yet), then loads SIMD, which triggers
+> SIMDExt cleanly.
 
 ```bash
-python benchmarks/benchmark_vs_julia.py --setup-julia
-# SIMD.jl: ~30 s   CUDA.jl: ~5–10 min (large package, precompiles GPU kernels)
+# Create a dedicated benchmark environment in ~/gaio_bench_env
+mkdir -p ~/gaio_bench_env
+cat > ~/gaio_bench_env/Project.toml << 'EOF'
+[deps]
+GAIO       = "33d280d1-ac47-4b0f-9c2e-fa6a385d0226"
+CUDA       = "052768ef-5323-5732-b1bb-66c8b64840ba"
+HostCPUFeatures = "3e5b6fbb-0976-4d2c-9146-d79de83f2fb0"
+SIMD       = "fdea26ae-647d-5447-a871-4b548cad5224"
+EOF
+
+# Install deps into this environment, pointing at our local GAIO.jl copy
+julia --project=~/gaio_bench_env -e "
+using Pkg
+Pkg.develop(path=\"$HOME/GAIO.py/references/GAIO.jl-master\")
+Pkg.add([\"SIMD\", \"HostCPUFeatures\", \"CUDA\"])
+Pkg.instantiate()
+Pkg.precompile()
+"
+# CUDA.jl: ~5–10 min first time.  SIMD + HostCPUFeatures: ~30 s.
 ```
 
-After this, the benchmark is ready:
+Verify SIMD loaded:
 
 ```bash
-python benchmarks/benchmark_vs_julia.py    # full 4-row table (README config)
+julia --project=~/gaio_bench_env -t auto -e '
+using GAIO, SIMD
+println("SIMDExt loaded: ", Base.get_extension(GAIO, :SIMDExt) !== nothing)
+P = GAIO.BoxGrid(GAIO.Box((0.0,0.0,0.0),(5.0,5.0,5.0)), (2,2,2))
+F = GAIO.BoxMap(:simd, identity, P)
+println("BoxMap(:simd) OK — type: ", nameof(typeof(F)))
+'
+# Expected:
+#   SIMDExt loaded: true
+#   BoxMap(:simd) OK — type: CPUSampledBoxMap
 ```
 
-### Full Julia setup one-liner
+### 3d. Run the benchmark using the wrapper environment
+
+Pass `--julia-project` to point at the benchmark environment instead of the
+GAIO.jl project directly:
+
+```bash
+python benchmarks/benchmark_vs_julia.py \
+    --julia-project ~/gaio_bench_env
+# julia-simd row should now appear instead of julia-default
+```
+
+> **Note:** `--setup-julia` is not needed when using the wrapper environment
+> — SIMD.jl and CUDA.jl were already installed in step 3c above.
+
+### Full Julia setup one-liner (with SIMD environment)
 
 ```bash
 JULIA_VERSION=1.10.8 && \
@@ -176,7 +225,16 @@ export PATH="$HOME/julia-${JULIA_VERSION}/bin:$PATH" && \
 echo "export PATH=\"\$HOME/julia-${JULIA_VERSION}/bin:\$PATH\"" >> ~/.bashrc && \
 julia --project="$HOME/GAIO.py/references/GAIO.jl-master" \
     -e 'using Pkg; Pkg.instantiate()' && \
-python "$HOME/GAIO.py/benchmarks/benchmark_vs_julia.py" --setup-julia
+mkdir -p ~/gaio_bench_env && \
+printf '[deps]\nGAIO = "33d280d1-ac47-4b0f-9c2e-fa6a385d0226"\nCUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"\nHostCPUFeatures = "3e5b6fbb-0976-4d2c-9146-d79de83f2fb0"\nSIMD = "fdea26ae-647d-5447-a871-4b548cad5224"\n' > ~/gaio_bench_env/Project.toml && \
+julia --project=~/gaio_bench_env -e "
+    using Pkg
+    Pkg.develop(path=\"\$HOME/GAIO.py/references/GAIO.jl-master\")
+    Pkg.add([\"SIMD\", \"HostCPUFeatures\", \"CUDA\"])
+    Pkg.instantiate(); Pkg.precompile()
+" && \
+python "$HOME/GAIO.py/benchmarks/benchmark_vs_julia.py" \
+    --julia-project ~/gaio_bench_env
 ```
 
 ---
