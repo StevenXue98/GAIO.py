@@ -89,7 +89,10 @@ except ImportError:
 _REPO_ROOT        = pathlib.Path(__file__).parent.parent
 _RESULTS_DIR      = _REPO_ROOT / "results"
 _JULIA_SCRIPT     = pathlib.Path(__file__).parent / "gaio_julia_benchmark.jl"
-_DEFAULT_JL_PROJ  = _REPO_ROOT / "references" / "GAIO.jl-master"
+# Prefer ~/gaio_bench_env (wrapper env that loads SIMDExt correctly) when it
+# exists; fall back to the in-repo reference copy otherwise.
+_GAIO_BENCH_ENV   = pathlib.Path.home() / "gaio_bench_env"
+_DEFAULT_JL_PROJ  = _GAIO_BENCH_ENV if _GAIO_BENCH_ENV.exists() else _REPO_ROOT / "references" / "GAIO.jl-master"
 
 
 def _find_julia() -> Optional[str]:

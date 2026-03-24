@@ -84,9 +84,13 @@ def _build_transitions(
     Returns
     -------
     rows, cols, vals : ndarray
-        COO triplets (un-normalised; each val = 1.0).  In MPI mode these
-        are the **global** triplets gathered from all ranks (identical on
-        every rank).
+        Global COO triplets (un-normalised; each val = 1.0).  In MPI mode
+        these are the **global** triplets gathered from all ranks (identical
+        on every rank).
+    local_rows, local_cols, local_vals : ndarray
+        Per-rank COO triplets **before** the Allgatherv step.  Used by the
+        SLEPc path to build PETSc directly from local edges, bypassing the
+        full-matrix intermediate.
 
     Algorithm
     ---------
@@ -130,7 +134,8 @@ def _build_transitions(
             "total_nnz_raw":     0,
             "partition_weights": np.empty(0, dtype=np.float32),
         }
-        return np.empty(0, I64), np.empty(0, I64), np.empty(0, F64), empty_stats
+        _empty = np.empty(0, I64)
+        return _empty, _empty, np.empty(0, F64), _empty, _empty, np.empty(0, F64), empty_stats
 
     unit_pts   = F._unit_points             # (M, ndim)
     cell_r_dom = domain.partition.cell_radius  # (ndim,)
@@ -163,60 +168,92 @@ def _build_transitions(
         local_cols = np.empty(0, I64)
         local_vals = np.empty(0, F64)
     else:
-        # ── Stages 1–3: test-point generation, map, key lookup ───────────────
-        # GPU path: key-based dispatch — no float64 coordinate round-trip.
-        # CPU / Python path: coordinate-based (unchanged).
+        cod_keys = codomain._keys                # sorted int64, shape (m,)
+        m_cod    = len(cod_keys)
+
         _gpu_backend = (
             hasattr(F, 'backend') and F.backend == 'gpu'
             and hasattr(F, '_gpu_dispatch')
         )
+
+        # hit_keys is set by the CPU/Python path or the GPU-without-CuPy fallback.
+        # When the GPU+CuPy path runs, it sets local_rows/cols/vals directly and
+        # leaves hit_keys as None (no CPU round-trip).
+        hit_keys = None
+
         if _gpu_backend:
-            # Keys in, keys out — unit_pts cached on device, no test_pts array.
-            hit_keys = F._gpu_dispatch(local_domain_keys, domain.partition)
+            d_hit_keys = F._gpu_dispatch(local_domain_keys, domain.partition)
+            try:
+                import cupy as cp
+                # ── GPU on-device COO assembly ────────────────────────────────
+                # cp.asarray is zero-copy: wraps the Numba device buffer.
+                cp_hits    = cp.asarray(d_hit_keys)           # (K*M,) on GPU
+                valid_mask = cp_hits >= 0
+                if not bool(valid_mask.any()):
+                    local_rows = np.empty(0, I64)
+                    local_cols = np.empty(0, I64)
+                    local_vals = np.empty(0, F64)
+                else:
+                    flat_idx  = cp.where(valid_mask)[0]
+                    hit_valid = cp_hits[flat_idx]
+                    local_src = (flat_idx // M).astype(cp.int64)
+                    col_valid = cp.asarray(local_col_offsets)[local_src]
+                    cp_cod    = cp.asarray(cod_keys)
+                    row_cand  = cp.searchsorted(cp_cod, hit_valid)
+                    if m_cod == 0:
+                        local_rows = np.empty(0, I64)
+                        local_cols = np.empty(0, I64)
+                        local_vals = np.empty(0, F64)
+                    else:
+                        rc_clip  = cp.minimum(row_cand, m_cod - 1)
+                        matched  = (row_cand < m_cod) & (cp_cod[rc_clip] == hit_valid)
+                        local_rows = cp.asnumpy(row_cand[matched]).astype(I64)
+                        local_cols = cp.asnumpy(col_valid[matched])
+                        local_vals = np.ones(len(local_rows), dtype=F64)
+                        # Phase 5: per-cell hit counts (small copy — local_K elements)
+                        if bool(matched.any()):
+                            np.add.at(
+                                hits_per_cell,
+                                cp.asnumpy(local_src[matched]).astype(np.int64),
+                                1,
+                            )
+            except ImportError:
+                # CuPy not installed — fall back to host copy + numpy path
+                hit_keys = d_hit_keys.copy_to_host()
         else:
             from gaio.core.boxset import BoxSet as _BoxSet
             local_bs = _BoxSet(domain.partition, local_domain_keys)
             centers  = local_bs.centers()
-
             test_pts = (
                 centers[:, np.newaxis, :]
                 + unit_pts[np.newaxis, :, :] * cell_r_dom[np.newaxis, np.newaxis, :]
             ).reshape(local_K * M, ndim)
-
             mapped   = F._apply_map(test_pts)
             hit_keys = codomain.partition.point_to_key_batch(mapped)
-        cod_keys = codomain._keys                # sorted int64, shape (m,)
-        m_cod    = len(cod_keys)
 
-        valid = hit_keys >= 0
-        if not valid.any():
-            local_rows = np.empty(0, I64)
-            local_cols = np.empty(0, I64)
-            local_vals = np.empty(0, F64)
-        else:
-            hit_valid = hit_keys[valid]
-            flat_idx  = np.where(valid)[0]
-            # Local source-cell index within THIS rank's shard
-            local_src = (flat_idx // M).astype(I64)
-            # Map local index → global COO column
-            col_valid = local_col_offsets[local_src]
-
-            row_cand   = np.searchsorted(cod_keys, hit_valid)
-            if m_cod == 0:
-                matched = np.zeros(len(row_cand), dtype=bool)
+        # ── CPU/numpy path: GPU-without-CuPy fallback or CPU/Python backend ──
+        if hit_keys is not None:
+            valid = hit_keys >= 0
+            if not valid.any():
+                local_rows = np.empty(0, I64)
+                local_cols = np.empty(0, I64)
+                local_vals = np.empty(0, F64)
             else:
-                rc_clipped = np.minimum(row_cand, m_cod - 1)
-                matched    = (row_cand < m_cod) & (cod_keys[rc_clipped] == hit_valid)
-
-            local_rows = row_cand[matched].astype(I64)
-            local_cols = col_valid[matched]
-            local_vals = np.ones(len(local_rows), dtype=F64)
-
-            # Phase 5: accumulate per-cell hit counts for next-frame weights.
-            # local_src[matched] maps each successful hit → local shard index.
-            # np.add.at is unbuffered: handles repeated indices correctly.
-            if matched.any():
-                np.add.at(hits_per_cell, local_src[matched], 1)
+                hit_valid = hit_keys[valid]
+                flat_idx  = np.where(valid)[0]
+                local_src = (flat_idx // M).astype(I64)
+                col_valid = local_col_offsets[local_src]
+                row_cand  = np.searchsorted(cod_keys, hit_valid)
+                if m_cod == 0:
+                    matched = np.zeros(len(row_cand), dtype=bool)
+                else:
+                    rc_clipped = np.minimum(row_cand, m_cod - 1)
+                    matched    = (row_cand < m_cod) & (cod_keys[rc_clipped] == hit_valid)
+                local_rows = row_cand[matched].astype(I64)
+                local_cols = col_valid[matched]
+                local_vals = np.ones(len(local_rows), dtype=F64)
+                if matched.any():
+                    np.add.at(hits_per_cell, local_src[matched], 1)
 
     # ── Stage 4: Allgatherv — collect global COO from all ranks ─────────────
     # allgather_coo returns a 4-tuple: (rows, cols, vals, per_rank_counts).
@@ -237,7 +274,7 @@ def _build_transitions(
         "total_nnz_raw":     int(per_rank_counts.sum()), # before matrix dedup
         "partition_weights": new_partition_weights,      # float32, shape (K,)
     }
-    return rows, cols, vals, mpi_stats
+    return rows, cols, vals, local_rows, local_cols, local_vals, mpi_stats
 
 
 class TransferOperator:
@@ -301,7 +338,7 @@ class TransferOperator:
     (16, 16)
     """
 
-    __slots__ = ("boxmap", "domain", "codomain", "mat", "mpi_stats", "_comm")
+    __slots__ = ("boxmap", "domain", "codomain", "mat", "mpi_stats", "_comm", "_local_coo")
 
     def __init__(
         self,
@@ -328,10 +365,15 @@ class TransferOperator:
             codomain = F(domain)
         self.codomain = codomain
 
-        rows, cols, vals, self.mpi_stats = _build_transitions(
-            F, domain, codomain, comm=self._comm,
-            partition_weights=partition_weights,
+        rows, cols, vals, local_rows, local_cols, local_vals, self.mpi_stats = (
+            _build_transitions(
+                F, domain, codomain, comm=self._comm,
+                partition_weights=partition_weights,
+            )
         )
+        # Local COO (pre-Allgatherv) — passed to SLEPc to build PETSc directly
+        # from per-rank edges, bypassing the global sparse matrix intermediate.
+        self._local_coo = (local_rows, local_cols, local_vals)
         m = len(codomain)
         n = len(domain)
 
@@ -500,6 +542,7 @@ class TransferOperator:
             self.mat, k,
             self.domain._keys, self.domain.partition,
             comm=self._comm, which=which,
+            local_coo=self._local_coo,
             **kwargs,
         )
 
@@ -524,5 +567,6 @@ class TransferOperator:
             self.domain._keys,   self.domain.partition,
             self.codomain._keys, self.codomain.partition,
             comm=self._comm,
+            local_coo=self._local_coo,
             **kwargs,
         )

@@ -226,9 +226,17 @@ class AcceleratedBoxMap:
 
         # ── GPU path: keys in, keys out — no float64 coordinate transfer ─
         if self.backend == BACKEND_GPU:
-            out_keys = self._gpu_dispatch(source._keys, P)
-            valid = out_keys[out_keys >= 0]
-            return BoxSet(P, np.unique(valid).astype(I64))
+            d_out_keys = self._gpu_dispatch(source._keys, P)  # Numba device array
+            try:
+                import cupy as cp
+                cp_keys = cp.asarray(d_out_keys)                   # zero-copy wrap
+                unique_keys = cp.unique(cp_keys[cp_keys >= 0])     # filter + dedup on GPU
+                return BoxSet(P, cp.asnumpy(unique_keys).astype(I64))
+            except ImportError:
+                # CuPy not installed — fall back to host copy
+                out_keys = d_out_keys.copy_to_host()
+                valid = out_keys[out_keys >= 0]
+                return BoxSet(P, np.unique(valid).astype(I64))
 
         # ── CPU / Python path ─────────────────────────────────────────────
         unit_pts = self._unit_points     # (M, n)

@@ -122,9 +122,6 @@ def _build_petsc_mat(
     local_m = r_hi - r_lo
 
     # ── Create parallel AIJ matrix ────────────────────────────────────────────
-    # setSizes expects ((local_m, global_m), (local_n, global_n)) or
-    # (global_m, global_n) — we use the explicit local size to ensure PETSc
-    # respects our row partitioning rather than re-distributing automatically.
     A = PETSc.Mat().create(comm=PETSc.COMM_WORLD)
     A.setSizes(((local_m, global_m), (PETSc.DECIDE, global_n)))
     A.setType(PETSc.Mat.Type.MPIAIJ)
@@ -138,14 +135,99 @@ def _build_petsc_mat(
     global_cols = coo.col.astype(np.int32)
     values      = coo.data.astype(np.float64)
 
-    # setValues: addv=True so repeated (i,j) entries are summed
-    # (there should be none after scipy CSR, but be safe)
     if len(values) > 0:
         A.setValues(global_rows, global_cols, values,
                     addv=PETSc.InsertMode.INSERT_VALUES)
 
     A.assemblyBegin(PETSc.Mat.AssemblyType.FINAL_ASSEMBLY)
     A.assemblyEnd(PETSc.Mat.AssemblyType.FINAL_ASSEMBLY)
+    return A
+
+
+def _build_petsc_mat_from_coo(
+    local_rows: NDArray[I64],
+    local_cols: NDArray[I64],
+    local_vals: NDArray[F64],
+    global_m: int,
+    global_n: int,
+    comm,
+) -> "petsc4py.PETSc.Mat":
+    """
+    Build a distributed, column-normalised PETSc MPIAIJ matrix from local COO.
+
+    Each rank supplies only the edges it computed (its Morton-order shard of
+    domain columns).  PETSc's ``assemblyBegin/End`` handles off-process row
+    insertions — entries whose row is owned by another rank are buffered and
+    communicated automatically.  Column normalisation (column-stochastic) is
+    applied in-place after assembly using ``multTranspose`` + ``diagonalScale``.
+
+    This avoids the ``Allgatherv`` / global scipy CSC round-trip required by
+    :func:`_build_petsc_mat`: each rank contributes O(nnz/P) entries rather
+    than O(nnz), and PETSc never receives the full matrix.
+
+    Parameters
+    ----------
+    local_rows, local_cols : ndarray, int64
+        Global row and column indices of COO entries computed by this rank.
+        Intra-rank duplicate ``(i, j)`` pairs (from multiple test points
+        landing in the same target cell) are summed via ``ADD_VALUES``.
+        No cross-rank ``(i, j)`` duplicates exist — each column ``j`` belongs
+        to exactly one rank via Morton decomposition.
+    local_vals : ndarray, float64
+        Raw hit counts (all 1.0); normalisation is applied post-assembly.
+    global_m, global_n : int
+        Full matrix dimensions (``len(codomain)``, ``len(domain)``).
+    comm : mpi4py communicator
+
+    Returns
+    -------
+    petsc4py.PETSc.Mat — assembled and column-normalised
+    """
+    from petsc4py import PETSc
+
+    r     = comm.Get_rank()
+    size  = comm.Get_size()
+    r_lo, r_hi = _row_range(global_m, r, size)
+    local_m = r_hi - r_lo
+
+    A = PETSc.Mat().create(comm=PETSc.COMM_WORLD)
+    A.setSizes(((local_m, global_m), (PETSc.DECIDE, global_n)))
+    A.setType(PETSc.Mat.Type.MPIAIJ)
+    A.setFromOptions()
+    A.setUp()
+
+    # ADD_VALUES: intra-rank duplicate (i,j) pairs are summed correctly.
+    # Off-process rows (owned by other ranks) are buffered and communicated
+    # by assemblyBegin/End — no explicit Allgatherv needed.
+    if len(local_vals) > 0:
+        A.setValues(
+            local_rows.astype(np.int32),
+            local_cols.astype(np.int32),
+            local_vals.astype(np.float64),
+            addv=PETSc.InsertMode.ADD_VALUES,
+        )
+
+    A.assemblyBegin(PETSc.Mat.AssemblyType.FINAL_ASSEMBLY)
+    A.assemblyEnd(PETSc.Mat.AssemblyType.FINAL_ASSEMBLY)
+
+    # ── Column-stochastic normalisation ───────────────────────────────────────
+    # col_sums[j] = sum_i A[i,j].  Divide each column j by col_sums[j],
+    # leaving zero columns unchanged (matches TransferOperator scipy path).
+    ones     = A.createVecLeft()    # Vec of length global_m, all 1s
+    ones.set(1.0)
+    col_sums = A.createVecRight()   # Vec of length global_n — filled by multTranspose
+    A.multTranspose(ones, col_sums)
+
+    arr = col_sums.getArray().copy()
+    nz  = arr != 0.0
+    arr[nz] = 1.0 / arr[nz]
+    col_sums.setArray(arr)
+    col_sums.assemble()
+
+    A.diagonalScale(l=None, r=col_sums)   # A[:,j] *= 1/col_sums[j]
+
+    ones.destroy()
+    col_sums.destroy()
     return A
 
 
@@ -160,6 +242,7 @@ def _slepc_eigs(
     domain_keys: NDArray[I64],
     domain_partition,
     comm,
+    local_coo=None,
 ) -> tuple[NDArray, list[BoxMeasure]]:
     """
     Compute *k* eigenvalues / eigenvectors of *mat_scipy* via SLEPc EPS.
@@ -172,6 +255,10 @@ def _slepc_eigs(
     domain_keys      : sorted int64 keys (for wrapping eigenvectors as BoxMeasure)
     domain_partition : BoxPartition
     comm             : mpi4py communicator
+    local_coo        : tuple (local_rows, local_cols, local_vals) or None
+        When provided, PETSc is built directly from per-rank local COO edges,
+        skipping the Allgatherv / global scipy intermediate.  When None,
+        falls back to :func:`_build_petsc_mat` (scipy → PETSc conversion).
 
     Returns
     -------
@@ -181,7 +268,14 @@ def _slepc_eigs(
     from petsc4py import PETSc
     from slepc4py import SLEPc
 
-    A = _build_petsc_mat(mat_scipy, comm)
+    if local_coo is not None:
+        local_rows, local_cols, local_vals = local_coo
+        A = _build_petsc_mat_from_coo(
+            local_rows, local_cols, local_vals,
+            mat_scipy.shape[0], mat_scipy.shape[1], comm,
+        )
+    else:
+        A = _build_petsc_mat(mat_scipy, comm)
 
     eps = SLEPc.EPS()
     eps.create(comm=PETSc.COMM_WORLD)
@@ -238,9 +332,16 @@ def _slepc_svds(
     codomain_keys: NDArray[I64],
     codomain_partition,
     comm,
+    local_coo=None,
 ) -> tuple[list[BoxMeasure], NDArray[F64], list[BoxMeasure]]:
     """
     Compute *k* singular triplets of *mat_scipy* via SLEPc SVD.
+
+    Parameters
+    ----------
+    local_coo : tuple (local_rows, local_cols, local_vals) or None
+        When provided, PETSc is built directly from per-rank local COO edges.
+        See :func:`_slepc_eigs` for full description.
 
     Returns
     -------
@@ -251,7 +352,14 @@ def _slepc_svds(
     from petsc4py import PETSc
     from slepc4py import SLEPc
 
-    A = _build_petsc_mat(mat_scipy, comm)
+    if local_coo is not None:
+        local_rows, local_cols, local_vals = local_coo
+        A = _build_petsc_mat_from_coo(
+            local_rows, local_cols, local_vals,
+            mat_scipy.shape[0], mat_scipy.shape[1], comm,
+        )
+    else:
+        A = _build_petsc_mat(mat_scipy, comm)
 
     svd = SLEPc.SVD()
     svd.create(comm=PETSc.COMM_WORLD)
@@ -336,6 +444,7 @@ def distributed_eigs(
     domain_partition,
     comm=None,
     which: str = "LM",
+    local_coo=None,
     **scipy_kwargs,
 ) -> tuple[NDArray, list[BoxMeasure]]:
     """
@@ -352,6 +461,10 @@ def distributed_eigs(
     domain_partition : BoxPartition
     comm             : mpi4py communicator or None
     which            : eigenvalue selection ('LM', 'SM', 'LR', 'SR')
+    local_coo        : tuple (local_rows, local_cols, local_vals) or None
+        When provided and SLEPc is used, PETSc is built directly from per-rank
+        local COO edges via :func:`_build_petsc_mat_from_coo`, bypassing the
+        global scipy matrix intermediate.  Ignored when falling back to scipy.
     **scipy_kwargs   : forwarded to scipy.sparse.linalg.eigs in fallback mode
 
     Returns
@@ -367,7 +480,8 @@ def distributed_eigs(
 
     if use_slepc:
         try:
-            return _slepc_eigs(mat, k, which, domain_keys, domain_partition, comm)
+            return _slepc_eigs(mat, k, which, domain_keys, domain_partition, comm,
+                               local_coo=local_coo)
         except Exception as exc:
             import warnings
             warnings.warn(
@@ -396,6 +510,7 @@ def distributed_svds(
     codomain_keys: NDArray[I64],
     codomain_partition,
     comm=None,
+    local_coo=None,
     **scipy_kwargs,
 ) -> tuple[list[BoxMeasure], NDArray[F64], list[BoxMeasure]]:
     """
@@ -410,6 +525,9 @@ def distributed_svds(
     codomain_keys      : int64 keys for left singular vectors
     codomain_partition : BoxPartition
     comm               : mpi4py communicator or None
+    local_coo          : tuple (local_rows, local_cols, local_vals) or None
+        When provided and SLEPc is used, PETSc is built directly from per-rank
+        local COO edges.  See :func:`distributed_eigs` for full description.
 
     Returns
     -------
@@ -426,7 +544,8 @@ def distributed_svds(
     if use_slepc:
         try:
             return _slepc_svds(mat, k, domain_keys, domain_partition,
-                               codomain_keys, codomain_partition, comm)
+                               codomain_keys, codomain_partition, comm,
+                               local_coo=local_coo)
         except Exception as exc:
             import warnings
             warnings.warn(

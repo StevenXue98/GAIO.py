@@ -262,10 +262,11 @@ class CUDADispatcher:
 
         Returns
         -------
-        out_keys : ndarray, shape (K*M,), int64
-            Hit keys; -1 for out-of-domain outputs.
-            Pass through ``out_keys[out_keys >= 0]`` then ``np.unique``
-            to obtain the image BoxSet keys.
+        out_keys : Numba CUDA device array, shape (K*M,), int64
+            Hit keys on device; -1 for out-of-domain outputs.
+            Wrap with ``cp.asarray(out_keys)`` for zero-copy CuPy access,
+            then filter and deduplicate on-device:
+            ``cp.unique(cp_keys[cp_keys >= 0])``.
         """
         from numba import cuda
 
@@ -288,4 +289,4 @@ class CUDADispatcher:
             d_in_keys, self.d_unit_pts, lo, cell_radius, dims, d_out_keys
         )
 
-        return d_out_keys.copy_to_host()   # (K*M,) int64
+        return d_out_keys   # Numba device array (K*M,) int64 — caller deduplicates on-device

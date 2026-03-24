@@ -42,7 +42,7 @@ using SparseArrays
 # so Julia raises MethodError.  Loading here (once, at startup) fixes that.
 
 const _SIMD_LOADED = try
-    @eval using SIMD
+    @eval using SIMD, HostCPUFeatures   # SIMDExt requires both trigger packages
     true
 catch
     false
@@ -98,25 +98,40 @@ _fw_f32(x) = rk4_flow_map(_fw32, x, 0.01f0, 20)
 
 # ── BoxMap construction ───────────────────────────────────────────────────────
 
-function make_boxmap_cpu(P, n_pts::Int)
+function make_boxmap_cpu(P, n_pts::Int; grid_res::Int=2, steps::Int=10)
     npts = ntuple(_ -> n_pts, 3)
     if _SIMD_LOADED
-        # Try several calling conventions — SIMDExt dispatch varies across GAIO.jl versions.
-        # Some versions accept n_points keyword; others require it to be omitted.
-        for call in [
-            () -> BoxMap(:simd, _fw_f64, P; n_points=npts),
-            () -> BoxMap(:grid, :simd, _fw_f64, P; n_points=npts),
-            () -> BoxMap(:simd, _fw_f64, P),
-            () -> BoxMap(:grid, :simd, _fw_f64, P),
-        ]
-            try
-                F = call()
-                return F, "simd"
-            catch
-                # try next convention
+        # SIMDExt @floop @reduce allocates per-thread Dict accumulators.  At the
+        # final merge level two half-size dicts coexist with the merged result, so
+        # peak memory ≈ 3 × nnz × ~120 B × n_threads.  The attractor size is not
+        # known until after relative_attractor runs, so we estimate via grid_res^3
+        # (initial cells) × steps as a proxy for problem complexity.
+        #
+        # Empirical thresholds on a 24-thread / 15 GB machine:
+        #   grid_res=2, steps=16 → 120k cells  → safe  (proxy ≈ 128)
+        #   grid_res=4, steps=10 →  25k cells  → safe  (proxy ≈ 640)
+        #   grid_res=4, steps=16 → 562k cells  → OOM   (proxy ≈ 1024)
+        # Threshold at proxy < 900 keeps the two safe cases and blocks the OOM.
+        proxy = grid_res^3 * steps
+        simd_mem_safe = proxy < 900
+
+        if simd_mem_safe
+            # Try several calling conventions — SIMDExt dispatch varies across GAIO.jl versions.
+            for call in [
+                () -> BoxMap(:simd, _fw_f64, P; n_points=npts),
+                () -> BoxMap(:grid, :simd, _fw_f64, P; n_points=npts),
+                () -> BoxMap(:simd, _fw_f64, P),
+                () -> BoxMap(:grid, :simd, _fw_f64, P),
+            ]
+                try
+                    F = call()
+                    return F, "simd"
+                catch
+                    # try next convention
+                end
             end
         end
-        # SIMDExt installed but none of the dispatch forms worked — fall through to default
+        # SIMDExt not safe for this size, or no dispatch form worked — fall through
     end
     F = BoxMap(:grid, _fw_f64, P; n_points=npts)
     return F, "default"
@@ -166,7 +181,7 @@ function main()
         if backend == "gpu"
             make_boxmap_gpu(P, test_pts)
         else
-            make_boxmap_cpu(P, test_pts)
+            make_boxmap_cpu(P, test_pts; grid_res=grid_res, steps=steps)
         end
     catch e
         emit_json(backend=backend, n_threads=Threads.nthreads(),
