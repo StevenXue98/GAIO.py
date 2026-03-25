@@ -19,7 +19,6 @@ For implementation details, design decisions, and MPI/GPU architecture see [docs
 ### Phase 3 — Single GPU vs GAIO.jl
 
 Run: `python benchmarks/benchmark_vs_julia.py --steps 10 --grid-res 4`
-Config: steps=10, grid\_res=4, test\_pts=4³=64, 24 CPU threads.
 
 | Impl | Threads | Cells | Map (s) | T\_op (s) | Total (s) | nnz | Speedup |
 |------|---------|-------|---------|-----------|-----------|-----|---------|
@@ -30,6 +29,7 @@ Config: steps=10, grid\_res=4, test\_pts=4³=64, 24 CPU threads.
 
 CPU: numba is **1.47× faster** than julia-simd.
 GPU: numba-cuda is **1.49× faster** than julia-cuda (julia-cuda T\_op uses float32; numba-cuda uses float64).
+Hardware: AMD Ryzen 9 7845HX (24 threads), NVIDIA RTX 4080 Laptop GPU (12 GB), WSL2.
 
 †julia-simd: run via a custom wrapper environment with a one-line fix for a `show_progress` keyword bug that prevented `SIMDExt` from loading. The fix only improved Julia's CPU performance.
 ‡julia-cuda: run with a one-line fix for a variable-shadowing bug in `CUDAExt.jl` that caused the GPU `TransferOperator` to silently return an empty matrix. The fix only improved Julia's GPU performance.
