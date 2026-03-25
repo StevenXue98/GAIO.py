@@ -183,6 +183,115 @@ println("BoxMap(:simd) OK — type: ", nameof(typeof(F)))
 '
 ```
 
+### 3d. Patch two GAIO.jl bugs before benchmarking
+
+Two bugs in the upstream GAIO.jl source affect benchmark correctness.
+Apply both patches now — they take under a minute.
+
+#### Bug 1 — `CUDAExt.jl`: GPU `TransferOperator` always returns nnz=0
+
+**File:** `/workspace/GAIO.jl/ext/CUDAExt.jl`
+
+Line 85 reassigns the `codomain` function parameter to an empty `BoxSet`,
+so the hit-detection test `hit in codomain.set` is always false and the
+resulting matrix is all-zeros.
+
+```bash
+# Confirm the bad line is present (prints the line if unfixed)
+grep -n "codomain = BoxSet(P2" /workspace/GAIO.jl/ext/CUDAExt.jl
+
+# Delete it
+sed -i '/codomain = BoxSet(P2, S())/d' /workspace/GAIO.jl/ext/CUDAExt.jl
+
+# Verify (should print nothing)
+grep -n "codomain = BoxSet(P2" /workspace/GAIO.jl/ext/CUDAExt.jl
+echo "CUDAExt patch applied"
+```
+
+#### Bug 2 — `SIMDExt.jl`: `construct_transfers` rejects `show_progress` keyword
+
+**File:** `/workspace/GAIO.jl/ext/SIMDExt.jl`
+
+`TransferOperator` passes `show_progress=true/false` to `construct_transfers`,
+but the two SIMDExt overloads don't declare that keyword — Julia raises a
+`MethodError: unsupported keyword argument` and the CPU benchmark fails.
+
+```bash
+# Confirm both signatures are unfixed (prints 2 lines if unfixed)
+grep -n "^@inbounds.*function construct_transfers\|^@inbounds @muladd.*function construct_transfers" \
+    /workspace/GAIO.jl/ext/SIMDExt.jl
+
+# Patch: add "; show_progress=false, kwargs..." to both 2-argument and 3-argument overloads.
+# The signatures look like:
+#   function construct_transfers(\n        G::CPUSampledBoxMap{simd}, domain::BoxSet{R,Q,S}\n    )
+# We add the keyword before the closing ) on the next line.
+
+python3 - <<'PYEOF'
+import re, pathlib
+
+p = pathlib.Path("/workspace/GAIO.jl/ext/SIMDExt.jl")
+src = p.read_text()
+
+# Pattern: the two-arg overload (no codomain parameter)
+src = re.sub(
+    r'(@inbounds function construct_transfers\(\s*\n\s*G::CPUSampledBoxMap\{simd\}, domain::BoxSet\{R,Q,S\}\s*\n\s*\))',
+    lambda m: m.group(0).rstrip(')') + '; show_progress::Bool=false, kwargs...\n    )',
+    src
+)
+
+# Pattern: the three-arg overload (with codomain parameter)
+src = re.sub(
+    r'(@inbounds @muladd function construct_transfers\(\s*\n\s*G::CPUSampledBoxMap\{simd\}, domain::BoxSet\{R,Q\}, codomain::BoxSet\{U,H\}\s*\n\s*\))',
+    lambda m: m.group(0).rstrip(')') + '; show_progress::Bool=false, kwargs...\n    )',
+    src
+)
+
+p.write_text(src)
+print("SIMDExt patch written")
+PYEOF
+
+# Verify both signatures now have show_progress
+grep -n "show_progress" /workspace/GAIO.jl/ext/SIMDExt.jl
+```
+
+#### Recompile GAIO.jl after patching
+
+```bash
+julia --project=~/gaio_bench_env -e '
+using Pkg
+Pkg.precompile()
+'
+# Takes ~2–5 min (CUDA.jl is already cached, only GAIO is recompiled)
+```
+
+#### Verify both fixes
+
+```bash
+# CUDAExt: TransferOperator should return non-zero nnz on GPU
+julia --project=~/gaio_bench_env -e '
+using GAIO, CUDA, SparseArrays
+P = GAIO.BoxGrid(GAIO.Box((0.0,0.0,0.0),(5.0,5.0,5.0)), (2,2,2))
+fw(x) = (0.2x[1]+x[2]*x[3], -0.4x[2]-0.01x[1]-x[3]*x[2], -x[3]-x[1]*x[2])
+f(x)  = GAIO.rk4_flow_map(fw, x, 0.01f0, 20)
+F = GAIO.BoxMap(:grid, :gpu, f, P; n_points=(4,4,4))
+A = GAIO.BoxSet(P, P)
+T = GAIO.TransferOperator(F, A, A)
+println("GPU T_op nnz = ", nnz(T.mat), "  (expect > 0)")
+' 2>&1
+
+# SIMDExt: TransferOperator with SIMD map should not raise MethodError
+julia --project=~/gaio_bench_env -t auto -e '
+using GAIO, SIMD, HostCPUFeatures, SparseArrays
+P = GAIO.BoxGrid(GAIO.Box((0.0,0.0,0.0),(5.0,5.0,5.0)), (2,2,2))
+fw(x) = (0.2x[1]+x[2]*x[3], -0.4x[2]-0.01x[1]-x[3]*x[2], -x[3]-x[1]*x[2])
+f(x)  = GAIO.rk4_flow_map(fw, x, 0.01, 20)
+F = GAIO.BoxMap(:grid, :simd, f, P; n_points=(4,4,4))
+A = GAIO.BoxSet(P, P)
+T = GAIO.TransferOperator(F, A, A)
+println("SIMD T_op nnz = ", nnz(T.mat), "  (expect > 0)")
+' 2>&1
+```
+
 ---
 
 ## 4. Python Verification Checklist
@@ -356,8 +465,9 @@ mpirun -n 8 --bind-to socket \
 | `ImportError: libmpi.so` | mpi4py linked to wrong libmpi | Reinstall: `MPICC=$(which mpicc) pip install --no-binary mpi4py mpi4py` |
 | `PMPI_Init_thread: Unknown error class` | UCX transport mismatch | `export UCX_TLS=tcp,cuda_copy` (disables CUDA IPC, safe fallback) |
 | `ModuleNotFoundError: No module named 'gaio'` | GAIO.py not installed | `pip install -e /workspace/GAIO.py/.[gpu,mpi,dev]` |
-| Julia `SIMDExt loaded: false` | Using `--project=/workspace/GAIO.jl` directly | Use `--julia-project ~/gaio_bench_env` (wrapper env) |
-| Julia GPU T_op nnz=0 | Known `CUDAExt.jl` variable shadowing bug | Expected; benchmark falls back to CPU T_op automatically. See §8. |
+| Julia `SIMDExt loaded: false` | Using `--project=/workspace/GAIO.jl` directly | Use `--julia-project ~/gaio_bench_env` (wrapper env, §3c) |
+| Julia GPU T_op nnz=0 | `CUDAExt.jl` variable shadowing bug | Apply patch from §3d |
+| Julia `MethodError: unsupported keyword argument "show_progress"` | `SIMDExt.construct_transfers` missing keyword | Apply patch from §3d |
 | Rank segfaults at MPI_Init | CUDA context before MPI | Call `cuda.select_device(rank)` before any GAIO computation |
 | `NumbaPerformanceWarning: Grid size 2` | Problem too small for GPU | Use `--steps 14 --grid-res 4` |
 | `ompi_info` shows no `cuda` extension | conda-forge openmpi without CUDA | Phase 4/5 still works via CPU staging; GPUDirect not available on PCIe A100 anyway |
@@ -366,14 +476,18 @@ mpirun -n 8 --bind-to socket \
 
 ## 8. Known GAIO.jl Bugs
 
-See `docs/LAMBDA_CLOUD_SETUP.md §8` for full diagnosis.  Summary:
-
-**Bug 1 — GPU `construct_transfers` always returns nnz=0** (`CUDAExt.jl:85`):
-Variable shadowing overwrites the `codomain` function parameter with an empty
-`BoxSet`, so `hit in codomain.set` is always false.  The GPU attractor map
-works correctly; only `TransferOperator` is affected.  Workaround: benchmark
-detects nnz=0 and falls back to CPU T_op, noting the bug in output.
+**Bug 1 — GPU `construct_transfers` always returns nnz=0** (`CUDAExt.jl`):
+Line `codomain = BoxSet(P2, S())` overwrites the `codomain` function parameter with an
+empty `BoxSet`, so `hit in codomain.set` is always false.
+**Fix:** `sed -i '/codomain = BoxSet(P2, S())/d' /workspace/GAIO.jl/ext/CUDAExt.jl`
+(see §3d for the full patch procedure).
 
 **Bug 2 — SIMDExt silently not loaded**: Running `julia --project=/workspace/GAIO.jl`
-directly causes a circular init dependency.  Fix: use the `~/gaio_bench_env`
-wrapper environment (§3c).
+directly causes a circular init dependency.
+**Fix:** use the `~/gaio_bench_env` wrapper environment (§3c).
+
+**Bug 3 — `SIMDExt.construct_transfers` rejects `show_progress` keyword**:
+The two SIMDExt `construct_transfers` overloads lack the `show_progress` keyword
+that `TransferOperator` passes, causing a `MethodError` and silent benchmark failure.
+**Fix:** add `; show_progress::Bool=false, kwargs...` to both signatures
+(see §3d for the full patch procedure).
