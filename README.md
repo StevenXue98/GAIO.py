@@ -1,6 +1,6 @@
 # GAIO.py
 
-**GAIO.py** is a Python library for set-oriented analysis of dynamical systems. It is a port of [GAIO.jl](https://github.com/gaioguys/GAIO.jl) by Herwig, Junge, and Dellnitz.
+**GAIO.py** is a Python library for set-oriented analysis of dynamical systems. It is based on [GAIO.jl](https://github.com/gaioguys/GAIO.jl) by Herwig, Junge, and Dellnitz, and extends it with multi-GPU support. 
 
 ## Why GAIO.py
 
