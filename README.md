@@ -53,7 +53,7 @@ Run `mpiexec -n N python benchmarks/benchmark_phase5.py`.
 | static Morton | — | — | ~4.5× (moderate) / ~30× (extreme) |
 | weighted Morton | — | — | ~1.0× |
 
-*Fill in Phases 4 and 5 on a multi-GPU cloud instance. Each benchmark script prints copy-paste-ready table rows at the end.*
+*In Progress*
 
 ---
 
